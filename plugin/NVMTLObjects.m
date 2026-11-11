@@ -2462,7 +2462,7 @@ static NSArray *nvmtl_vertex_attributes_for(NVMTLFunction *fn) {
 - (NSUInteger)arrayLength { return _len; }
 - (NSUInteger)stride { return _stride; }
 - (NSUInteger)argumentIndexStride { return 0; }
-- (id)elementStructType { return nil; }
+- (id)elementStructType { return _elemStruct; }
 - (id)elementArrayType { return nil; }
 - (id)elementTextureReferenceType { return nil; }
 - (id)elementPointerType { return nil; }
@@ -2574,6 +2574,34 @@ static MTLTextureType nvmtl_textype_for_shape(id shape) {
     return [s rangeOfString:@"Array"].location != NSNotFound ? MTLTextureType2DArray : MTLTextureType2D;
 }
 static BOOL nvmtl_binding_active(NSDictionary *b) { id acc = b[@"access"]; return !([acc isKindOfClass:[NSString class]] && [acc isEqualToString:@"Unused"]); }
+// A struct from its AIR member list (offset, size, count, type, name; "struct" for a nested struct's own list), as Apple
+// reflects it. struct_type_info gives the element size and an element count (0 = not an array). An array is reported as
+// Apple does, MTLDataTypeArray with its MTLArrayType (length 1 included): engines size their uniform copies from it. WAS: the
+// element alone, so Hades (The Forge) copied one float4x4 of its float4x4[2] and every screen-space sprite read zeros.
+// A nested struct is MTLDataTypeStruct with its MTLStructType (or the array's elementStructType); WAS: no members, and VFX
+// (Messages' animated backgrounds) could not match particle_header.descriptions[] and refused the graph.
+// *end: one past the last byte the members cover.
+static NVMTLStructType *nvmtl_struct_type_from_air_end(NSArray *ms, NSUInteger *end) {
+    if (![ms isKindOfClass:[NSArray class]] || !ms.count) return nil;
+    NSMutableArray *members = [NSMutableArray new]; NSUInteger i = 0;
+    for (NSDictionary *am in ms) {
+        if (![am isKindOfClass:[NSDictionary class]]) continue;
+        NVMTLStructMember *m = [NVMTLStructMember new];
+        m->_offset = [am[@"off"] unsignedLongValue]; m->_argIndex = i++; m->_name = am[@"name"];
+        m->_dataType = nvmtl_datatype_for_air_name(am[@"type"]);
+        NVMTLStructType *sub = nvmtl_struct_type_from_air_end(am[@"struct"], NULL);
+        if (m->_dataType == MTLDataTypeNone || sub) m->_dataType = MTLDataTypeStruct;
+        const NSUInteger cnt = [am[@"count"] unsignedLongValue], sz = [am[@"size"] unsignedLongValue];
+        if (cnt >= 1) { NVMTLArrayType *at = [NVMTLArrayType new]; at->_dataType = MTLDataTypeArray; at->_elem = m->_dataType; at->_len = cnt; at->_stride = sz;
+                        at->_elemStruct = sub; m->_arr = at; m->_dataType = MTLDataTypeArray; }
+        else m->_struct = sub;
+        if (end) { const NSUInteger e = m->_offset + sz * (cnt ? cnt : 1); if (e > *end) *end = e; }
+        [members addObject:m];
+    }
+    NVMTLStructType *st = [NVMTLStructType new]; st->_dataType = MTLDataTypeStruct; st->_members = members;
+    return st;
+}
+static NVMTLStructType *nvmtl_struct_type_from_air(NSArray *ms) { return nvmtl_struct_type_from_air_end(ms, NULL); }
 static NVMTLArgument *nvmtl_build_buffer_argument(NVMTLFunction *fn, NSUInteger index, NSDictionary *binding, NSDictionary *refl, NSDictionary *names) {
     NVMTLArgument *a = [NVMTLBufferArgument new];
     a->_type = MTLBindingTypeBuffer; a->_index = index; a->_active = nvmtl_binding_active(binding); a->_arrayLength = 1; a->_bufAlign = 16;
@@ -2590,7 +2618,11 @@ static NVMTLArgument *nvmtl_build_buffer_argument(NVMTLFunction *fn, NSUInteger 
     for (NSDictionary *b in refl[@"bindings"]) {
         NSDictionary *src = b[@"embedded_source"]; if (![src isKindOfClass:[NSDictionary class]]) continue;
         if ([src[@"buffer_index"] unsignedLongValue] != index) continue;
-        kindAt[src[@"field_offset"]] = [b[@"kind"] isEqualToString:@"EmbeddedArgBufferSampler"] ? @"sampler" : @"texture";
+        // three kinds: an embedded buffer is a device pointer, not a texture. Reported as a texture, VFX (Messages' animated
+        // backgrounds) refused the pipeline: "ibl should be a buffer pointer in global_constants".
+        NSString *k = b[@"kind"];
+        kindAt[src[@"field_offset"]] = [k isEqualToString:@"EmbeddedArgBufferSampler"] ? @"sampler"
+                                     : [k isEqualToString:@"EmbeddedArgBufferBuffer"] ? @"buffer" : @"texture";
     }
     NSUInteger end = 0;
     for (NSDictionary *f0 in refl[@"argument_buffer_fields"]) {
@@ -2602,34 +2634,32 @@ static NVMTLArgument *nvmtl_build_buffer_argument(NVMTLFunction *fn, NSUInteger 
         NSString *tn = types[mk]; NSString *kind = kindAt[f0[@"field_offset"]];
         if ([kind isEqualToString:@"sampler"]) m->_dataType = MTLDataTypeSampler;
         else if ([kind isEqualToString:@"texture"]) m->_dataType = MTLDataTypeTexture;
+        else if ([kind isEqualToString:@"buffer"]) m->_dataType = MTLDataTypePointer;
         else if ([f0[@"resource_buffer_index"] isKindOfClass:[NSNumber class]]) m->_dataType = MTLDataTypePointer;
         else m->_dataType = tn ? nvmtl_datatype_for_air_name(tn) : MTLDataTypePointer;
         if (m->_dataType == MTLDataTypeTexture) { m->_texRef = [NVMTLTextureReferenceType new]; m->_texRef->_dataType = MTLDataTypeTexture; m->_texRef->_texDataType = MTLDataTypeFloat;
             m->_texRef->_texType = [tn rangeOfString:@"cube"].location != NSNotFound ? MTLTextureTypeCube : [tn rangeOfString:@"3d"].location != NSNotFound ? MTLTextureType3D
                                  : [tn rangeOfString:@"2d_array"].location != NSNotFound ? MTLTextureType2DArray : MTLTextureType2D;
             m->_texRef->_depth = [tn hasPrefix:@"depth"]; }
-        if (m->_dataType == MTLDataTypePointer) { m->_ptr = [NVMTLPointerType new]; m->_ptr->_dataType = MTLDataTypePointer; m->_ptr->_elem = MTLDataTypeStruct; m->_ptr->_align = 16; }
+        if (m->_dataType == MTLDataTypePointer) { m->_ptr = [NVMTLPointerType new]; m->_ptr->_dataType = MTLDataTypePointer; m->_ptr->_elem = MTLDataTypeStruct; m->_ptr->_align = 16;
+            // what it points at, from the AIR (nvmtl_air_names "ptrs"): its size, alignment and struct, as Apple reports them
+            NSDictionary *pi = [names[@"ptrs"] isKindOfClass:[NSDictionary class]] ? names[@"ptrs"][mk] : nil;
+            if ([pi isKindOfClass:[NSDictionary class]]) {
+                const NSUInteger psz = [pi[@"size"] unsignedIntegerValue], pal = [pi[@"align"] unsignedIntegerValue];
+                if (psz) m->_ptr->_size = psz;
+                if (pal) m->_ptr->_align = pal;
+                NVMTLStructType *es = nvmtl_struct_type_from_air(pi[@"members"]);
+                if (es) m->_ptr->_elemStruct = es;
+                else if (tn) { const MTLDataType et = nvmtl_datatype_for_air_name(tn); if (et != MTLDataTypeNone && et != MTLDataTypePointer) m->_ptr->_elem = et; }
+            } }
         NSUInteger e = m->_offset + (m->_dataType == MTLDataTypeFloat4x4 ? 64 : m->_dataType == MTLDataTypeFloat3x3 ? 48 : 8);
         if (e > end) end = e;
         [members addObject:m];
     }
     NSArray *airPlain = [names[@"plain"] isKindOfClass:[NSDictionary class]] ? names[@"plain"][@(index)] : nil;
     if (!members.count && [airPlain isKindOfClass:[NSArray class]] && airPlain.count) {
-        NSUInteger i = 0;
-        for (NSDictionary *am in airPlain) {
-            NVMTLStructMember *m = [NVMTLStructMember new];
-            m->_offset = [am[@"off"] unsignedLongValue]; m->_argIndex = i++; m->_name = am[@"name"];
-            m->_dataType = nvmtl_datatype_for_air_name(am[@"type"]);
-            if (m->_dataType == MTLDataTypeNone) m->_dataType = MTLDataTypeStruct;
-            // struct_type_info gives the element size and an element count (0 = not an array). An array is reported as
-            // Apple does, MTLDataTypeArray with its MTLArrayType: engines size their uniform copies from it. WAS: the element
-            // alone, so Hades (The Forge) copied one float4x4 of its float4x4[2] and every screen-space sprite read zeros.
-            NSUInteger cnt = [am[@"count"] unsignedLongValue], sz = [am[@"size"] unsignedLongValue];
-            if (cnt > 1) { NVMTLArrayType *at = [NVMTLArrayType new]; at->_dataType = MTLDataTypeArray; at->_elem = m->_dataType; at->_len = cnt; at->_stride = sz;
-                m->_arr = at; m->_dataType = MTLDataTypeArray; }
-            NSUInteger e = m->_offset + sz * (cnt > 1 ? cnt : 1); if (e > end) end = e;
-            [members addObject:m];
-        }
+        NVMTLStructType *st = nvmtl_struct_type_from_air_end(airPlain, &end);
+        if (st) [members addObjectsFromArray:st->_members];
     }
     if (!members.count && [binding[@"type_layout"] isKindOfClass:[NSDictionary class]]) {
         NSArray *ms = binding[@"type_layout"][@"Struct"];
