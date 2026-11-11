@@ -91,7 +91,8 @@ uint64_t nvmtl_resid_for_sampler(id s);
 // _type holds MTLArgumentType values in its underlying NSUInteger; MTLBindingType, the replacement, numbers them the same
 @interface NVMTLArgument : NSObject { @public NSString *_name; NSUInteger _type; MTLBindingAccess _access; NSUInteger _index; BOOL _active;
   NSUInteger _arrayLength, _bufAlign, _bufSize; MTLDataType _bufDataType; NVMTLStructType *_bufStruct; NVMTLPointerType *_bufPtr;
-  MTLTextureType _texType; MTLDataType _texDataType; BOOL _depth; } @end
+  MTLTextureType _texType; MTLDataType _texDataType; BOOL _depth;
+  __weak NVMTLFunction *_encFn; } @end   // a buffer binding's function: -newArgumentEncoderWithBufferBinding: encodes for it
 @interface NVMTLRenderPipelineReflection : NSObject { @public NSArray *_v, *_f, *_o, *_m; } @end
 @interface NVMTLComputePipelineReflection : NSObject { @public NSArray *_a; } @end
 NSArray<NVMTLArgument *> *nvmtl_arguments_for_function(NVMTLFunction *fn);
