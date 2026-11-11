@@ -1712,6 +1712,100 @@ static void nvmtl_vram_keep_put(int host, IOSurfaceRef surf, NSUInteger plane, n
     for (unsigned k = 0; k < ng; k++) nvmtl_vram_keep_release(&gone[k]);
     nvmtl_vram_keep_schedule();
 }
+// Private surface images (multi-plane video and image tiles, surfaces the family VRAM cannot back) were made and freed
+// with every wrapper. CoreVideo's texture cache wraps each pooled pixel buffer anew, so a CMPhoto downscale paid an image,
+// its memory, its bind and their release for every tile, and a video frame the same per plane: well over half of a 6K
+// HEIC downscale once its shader scans were cached. A released one is parked here whole (image, memory, view) and handed
+// to the next private image of the same shape. Its contents need not survive: a wrapper copies its surface in before the
+// first use (nvmtlSurfaceIn), as it does into a new image. A parked image is reused only once every submit that could
+// still read it at its release has completed, is held at most NVMTL_SPARK_IDLE_NS, and all of them at most
+// NVMTL_SPARK_BYTES. NVMTL_SURF_IMAGE_PARK=0 turns it off.
+#define NVMTL_SPARK_N       16
+#define NVMTL_SPARK_IDLE_NS (500ull * 1000 * 1000)
+#define NVMTL_SPARK_BYTES   (256ull << 20)
+typedef struct { nvk_image img; uint32_t key[8]; uint64_t seq, parked; } nvmtl_spark_t;
+static nvmtl_spark_t g_spark[NVMTL_SPARK_N];
+static unsigned g_spark_n, g_spark_sweep;
+static uint64_t g_spark_bytes;
+static unsigned long long g_spark_hit, g_spark_miss;
+static pthread_mutex_t g_spark_lock = PTHREAD_MUTEX_INITIALIZER;
+static int nvmtl_spark_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMAGE_PARK"); on = !(e && e[0] == '0');
+        nvlog("private surface images: released ones %s (NVMTL_SURF_IMAGE_PARK=%s)", on ? "are reused" : "are freed", e ?: "unset"); }
+    return on;
+}
+// Removes entry k under the lock and hands its image back, to be destroyed outside it.
+static nvk_image nvmtl_spark_take_at(unsigned k)
+{
+    const nvk_image i = g_spark[k].img;
+    g_spark_bytes -= i.alloc;
+    g_spark[k] = g_spark[--g_spark_n];
+    return i;
+}
+static void nvmtl_spark_schedule(void);
+static void nvmtl_spark_sweep(void)
+{
+    nvk_image gone[NVMTL_SPARK_N]; unsigned ng = 0;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_mutex_lock(&g_spark_lock);
+    for (unsigned k = 0; k < g_spark_n; ) if (now - g_spark[k].parked >= NVMTL_SPARK_IDLE_NS) gone[ng++] = nvmtl_spark_take_at(k); else k++;
+    const int more = g_spark_n != 0;
+    g_spark_sweep = 0;
+    pthread_mutex_unlock(&g_spark_lock);
+    for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    if (more) nvmtl_spark_schedule();
+}
+static void nvmtl_spark_schedule(void)
+{
+    pthread_mutex_lock(&g_spark_lock);
+    const int go = !g_spark_sweep && g_spark_n; if (go) g_spark_sweep = 1;
+    pthread_mutex_unlock(&g_spark_lock);
+    if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_SPARK_IDLE_NS),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_spark_sweep(); });
+}
+// A parked image of this shape whose last possible reader has completed: 0 and *out, or -1.
+static int nvmtl_spark_take(const uint32_t key[8], nvk_image *out)
+{
+    if (!nvmtl_spark_on()) return -1;
+    const uint64_t done = nvmtl_vk_finished_seq();
+    int got = -1;
+    pthread_mutex_lock(&g_spark_lock);
+    for (unsigned k = g_spark_n; k-- > 0; ) {
+        if (memcmp(g_spark[k].key, key, sizeof g_spark[k].key) || g_spark[k].seq > done) continue;
+        *out = nvmtl_spark_take_at(k); got = 0; break;
+    }
+    if (got) g_spark_miss++; else g_spark_hit++;
+    const unsigned long long hit = g_spark_hit, miss = g_spark_miss;
+    pthread_mutex_unlock(&g_spark_lock);
+    // hz_ut caches the hazard mode of the texture that owned the image; the new owner's is decided on its first bind
+    if (!got) { out->hz_ut = 0; nvmtl_vk_image_recycled(out); }
+    if (hit + miss < 4 || (hit + miss) % 20000 == 0) nvlog("private surface image %s (%llu reused, %llu made)", got ? "made" : "reused", hit, miss);
+    return got;
+}
+// The released private image of a surface wrapper: parked, or destroyed when it cannot be. Clears *img either way.
+static void nvmtl_spark_put(const uint32_t key[8], nvk_image *img)
+{
+    if (!img->img) return;
+    if (!nvmtl_spark_on() || !img->alloc || img->alloc > NVMTL_SPARK_BYTES || img->sparse || img->pool || img->placed) {
+        nvmtl_vk_image_destroy(img); return; }
+    nvmtl_vk_image_upload_barrier(img);   // an async upload into it must land before another surface's copy can
+    nvmtl_vk_image_parked(img);
+    nvmtl_spark_t e = { .img = *img, .seq = nvmtl_vk_release_horizon(), .parked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
+    memcpy(e.key, key, sizeof e.key);
+    nvk_image gone[NVMTL_SPARK_N]; unsigned ng = 0;
+    pthread_mutex_lock(&g_spark_lock);
+    while (g_spark_n && (g_spark_n == NVMTL_SPARK_N || g_spark_bytes + img->alloc > NVMTL_SPARK_BYTES)) {
+        unsigned o = 0; for (unsigned k = 1; k < g_spark_n; k++) if (g_spark[k].parked < g_spark[o].parked) o = k;
+        gone[ng++] = nvmtl_spark_take_at(o);
+    }
+    g_spark[g_spark_n++] = e; g_spark_bytes += img->alloc;
+    pthread_mutex_unlock(&g_spark_lock);
+    memset(img, 0, sizeof *img);
+    for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    nvmtl_spark_schedule();
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
@@ -1774,7 +1868,10 @@ private_image:
               (plane != 0 || pplanes > 1) ? "more than one plane" : ((size_t)w * (bpp ? bpp : 4) > prow || h > IOSurfaceGetHeight(surf)) ? "image larger than the surface"
               : (prow % 32) ? "the row is not a multiple of 32 bytes" : "the family VRAM could not be used", prow, pplanes);
     }
-    const int rc = nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+    // the shape is every argument of the create below, so a parked image is exactly the image it would make
+    const uint32_t key[8] = { w, h, vkf, bpp, (uint32_t)a8, (uint32_t)stex, 2u, 1u };
+    const int rc = surf && !nvmtl_spark_take(key, &t->_i) ? 0 : nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+    if (!rc && surf) { memcpy(t->_sparkKey, key, sizeof key); t->_sparkable = YES; }
     if (!rc && surf) (void)nvmtl_vram_keep_get(1, surf, plane, 0, &t->_hostPages, &t->_vramBorn);
     return rc;
 }
@@ -1802,6 +1899,77 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) 
     return usage;
 }
 
+// A surface backing that wrappers share (a private image, or a Managed surface's tiled GPU image) lived only as long as
+// some wrapper did: the cache holds it weakly. CoreVideo's texture cache and CMPhoto release each wrapper before making
+// the next, so the backing died in between and the next wrapper paid the import, a new image and a full copy-in again:
+// CMPhoto re-wrapped a 6016x6016 HEIC (144 MB) that way for every tile it read. A backing is kept here for
+// NVMTL_LINGER_NS after its last wrap, within NVMTL_LINGER_BYTES, and never past the import age the VRAM keep allows,
+// so a family backing the surface replaced is still picked up again. NVMTL_SURF_LINGER=0 turns it off.
+#define NVMTL_LINGER_N     8
+#define NVMTL_LINGER_NS    (250ull * 1000 * 1000)
+#define NVMTL_LINGER_BYTES (512ull << 20)
+static NSMutableArray *g_linger_tex;   // NVMTLTexture, oldest wrap first
+static NSMutableArray<NSNumber *> *g_linger_at;
+static os_unfair_lock g_linger_lk = OS_UNFAIR_LOCK_INIT;
+static int g_linger_sched;
+static int nvmtl_linger_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_LINGER"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static int nvmtl_linger_expired(NVMTLTexture *t, uint64_t at, uint64_t now)
+{
+    return now - at >= NVMTL_LINGER_NS || (t->_vramOn && now - t->_vramBorn >= NVMTL_VRAM_KEEP_AGE_NS);
+}
+static void nvmtl_linger_schedule(void);
+static void nvmtl_linger_sweep(void)
+{
+    NSMutableArray *gone = [NSMutableArray new];   // released after the lock: a backing's dealloc runs here
+    const uint64_t now = nvmtl_vram_keep_now();
+    os_unfair_lock_lock(&g_linger_lk);
+    for (NSUInteger k = 0; k < g_linger_tex.count; ) {
+        if (nvmtl_linger_expired(g_linger_tex[k], g_linger_at[k].unsignedLongLongValue, now)) {
+            [gone addObject:g_linger_tex[k]]; [g_linger_tex removeObjectAtIndex:k]; [g_linger_at removeObjectAtIndex:k];
+        } else k++;
+    }
+    const int more = g_linger_tex.count != 0;
+    g_linger_sched = more;
+    os_unfair_lock_unlock(&g_linger_lk);
+    [gone removeAllObjects];
+    if (more) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_LINGER_NS),
+                             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_linger_sweep(); });
+}
+static void nvmtl_linger_schedule(void)
+{
+    os_unfair_lock_lock(&g_linger_lk);
+    const int go = !g_linger_sched && g_linger_tex.count; if (go) g_linger_sched = 1;
+    os_unfair_lock_unlock(&g_linger_lk);
+    if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_LINGER_NS),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_linger_sweep(); });
+}
+// A wrap of this backing: it stays alive NVMTL_LINGER_NS from now (oldest dropped first past the count or bytes).
+static void nvmtl_linger_touch(NVMTLTexture *t)
+{
+    if (!t || !nvmtl_linger_on() || t->_i.alloc > NVMTL_LINGER_BYTES) return;
+    NSMutableArray *gone = [NSMutableArray new];
+    const uint64_t now = nvmtl_vram_keep_now();
+    os_unfair_lock_lock(&g_linger_lk);
+    if (!g_linger_tex) { g_linger_tex = [NSMutableArray new]; g_linger_at = [NSMutableArray new]; }
+    const NSUInteger at = [g_linger_tex indexOfObjectIdenticalTo:t];
+    if (at != NSNotFound) { [g_linger_tex removeObjectAtIndex:at]; [g_linger_at removeObjectAtIndex:at]; }
+    if (!nvmtl_linger_expired(t, now, now)) {
+        [g_linger_tex addObject:t]; [g_linger_at addObject:@(now)];
+        uint64_t bytes = 0; for (NVMTLTexture *x in g_linger_tex) bytes += x->_i.alloc;
+        while (g_linger_tex.count > NVMTL_LINGER_N || (bytes > NVMTL_LINGER_BYTES && g_linger_tex.count > 1)) {
+            NVMTLTexture *o = g_linger_tex[0]; bytes -= o->_i.alloc;
+            [gone addObject:o]; [g_linger_tex removeObjectAtIndex:0]; [g_linger_at removeObjectAtIndex:0];
+        }
+    }
+    os_unfair_lock_unlock(&g_linger_lk);
+    [gone removeAllObjects];
+    nvmtl_linger_schedule();
+}
 static char nvmtl_surface_cache_key;
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
@@ -1845,6 +2013,7 @@ static char nvmtl_surface_cache_key;
         if (alias) {
             alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, alias->_stex); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
             nvmtl_texture_desc_swizzle(alias, d);
+            nvmtl_linger_touch(backing);
             return alias;
         }
     }
@@ -1857,7 +2026,7 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage == 1;
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && (!t->_vramOn || t->_surfaceLinear.img)) [cache setObject:t forKey:key];
+    if (key && (!t->_vramOn || t->_surfaceLinear.img)) { [cache setObject:t forKey:key]; nvmtl_linger_touch(t); }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }

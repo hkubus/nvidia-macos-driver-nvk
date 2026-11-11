@@ -1509,6 +1509,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (_swzView) nvmtl_vk_image_view_destroy(_swzView);
     if (!_parent && _parkable && _subHeap && _i.img) nvmtl_heap_park(_subHeap, &_i, _pkey, _heapOffset, _pkLen);
     if (!_parent && _bparkable && _backBuf && _i.img) nvmtl_bpark_put(_backBuf, &_i, _pkey);
+    if (!_parent && _sparkable && _i.img) nvmtl_spark_put(_sparkKey, &_i);   // clears _i, so the destroy below skips it
     if (!_parent) { nvmtl_vk_image_dying_label(_label.UTF8String); nvmtl_vk_image_destroy(&_i); }
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (_sparseHeap) {   // a sparse texture's pages go back to its heap (the mapped blocks and the mip tail)
