@@ -2002,7 +2002,11 @@ static char nvmtl_surface_cache_key;
     // drawable. Request the real storage view before importing family VRAM;
     // the private fallback already makes eligible formats writable.
     if (!wantStex && nvmtl_surface_widen_usage(t->_fbo) && !a8 && nvmtl_vk_format_is_storage(vkf)) wantStex = 1;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    // The same seven values, packed as bytes: an NSArray key hashes to its element count, so every entry collided and each
+    // lookup (every wrap the window server makes) compared arrays against every entry, the dead weak ones included.
+    NSData *key = nil;
+    if (surf) { const uint64_t k7[7] = { IOSurfaceGetID(surf), plane, w, h, d.pixelFormat, t->_ropt, (uint64_t)t->_fbo };
+                key = [NSData dataWithBytes:k7 length:sizeof k7]; }
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Private and Managed tiled backings are local to this device. Repeated
     // wrappers of the same surface must share that image,
