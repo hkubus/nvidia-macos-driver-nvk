@@ -1591,7 +1591,14 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 // is never handed out past NVMTL_VRAM_KEEP_AGE_NS from its import, so a backing the family replaced is picked up again
 // as before. A private image's imported surface pages (nvmtl_vk_image_write_host / _read_host) are kept the same way:
 // pinning and mapping them costs more than copying a 1080p frame. NVMTL_VRAM_KEEP=0 turns both off.
-#define NVMTL_VRAM_KEEP_N       64
+// Size: once the surfaces WindowServer composites outgrow the budget, the oldest-parked eviction throws out each import
+// just before its next wrapper asks for it, and every wrapper imports again. Measured on 3440x1440 (19.8 MB a surface):
+// 6 surfaces wrapped per frame cost 0.04 ms, 7 cost 3.9 ms, 9 cost 12 ms, 12 cost 28 ms. WAS a fixed 128 MiB and 64
+// entries (six full-screen surfaces of an ultrawide); the budget now follows the card (an eighth of VRAM, 128 MiB to
+// 1 GiB, NVMTL_VRAM_KEEP_MB still sets it) and up to 192 imports are kept. A kept import holds a surface its app still
+// has, or for at most NVMTL_VRAM_KEEP_IDLE_NS one it let go, so the larger budget costs no memory while the desktop is
+// steady.
+#define NVMTL_VRAM_KEEP_N       192
 #define NVMTL_VRAM_KEEP_IDLE_NS (250ull * 1000 * 1000)
 #define NVMTL_VRAM_KEEP_AGE_NS  (2000ull * 1000 * 1000)
 typedef struct { IOSurfaceRef surf; NSUInteger plane; size_t need; nvk_buffer vb; uint64_t born, parked; int host; } nvmtl_vram_kept;
@@ -1605,7 +1612,8 @@ static uint64_t nvmtl_vram_keep_cap(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *e = getenv("NVMTL_VRAM_KEEP"), *mb = getenv("NVMTL_VRAM_KEEP_MB");
-        cap = 128ull << 20;
+        const uint64_t card = nvmtl_vk_vram_bytes() / 8;
+        cap = card < (128ull << 20) ? 128ull << 20 : card > (1024ull << 20) ? 1024ull << 20 : card;
         if (mb && *mb) {
             char *end = NULL;
             const unsigned long long n = strtoull(mb, &end, 10);
