@@ -3347,6 +3347,23 @@ static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
     nvlog("newArgumentEncoderWithArguments: %lu descriptor(s) -> %lu field(s), %lu bytes", (unsigned long)args.count, (unsigned long)fields.count, (unsigned long)off);
     return e;
 }
+// The Metal 3 way to an encoder for a pipeline's argument buffer: from its reflection's buffer binding (VFX, which draws
+// Messages' animated chat backgrounds, asks this way). Without it the call reached the system's base class, whose fallback
+// (-newIndirectArgumentEncoderWithLayout:) aborts the process, so the extension crashed on launch and was relaunched in a
+// loop. A binding this driver reflected knows its function, which lays the encoder out from the AIR as
+// -newArgumentEncoderWithBufferIndex: does; any other binding gets nil, which an app can check, instead of an abort.
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)binding {
+    if ([(id)binding isKindOfClass:[NVMTLArgument class]]) {
+        NVMTLArgument *a = (NVMTLArgument *)binding;
+        NVMTLFunction *fn = a->_encFn;
+        id<MTLArgumentEncoder> e = fn ? [fn newArgumentEncoderWithBufferIndex:a->_index] : nil;
+        nvlog("newArgumentEncoderWithBufferBinding: \"%s\" buffer %lu of %s -> %p", a->_name.UTF8String ?: "-", (unsigned long)a->_index,
+              fn ? fn->_fname.UTF8String : "(function gone)", (__bridge void *)e);
+        return e;
+    }
+    { static int said; if (said++ < 4) nvlog("newArgumentEncoderWithBufferBinding: a %s binding (not reflected by this driver) - nil", object_getClassName(binding)); }
+    return nil;
+}
 - (NSUInteger)currentAllocatedSize { return (NSUInteger)nvmtl_vk_allocated_bytes(); }
 - (uint64_t)recommendedMaxWorkingSetSize {
     uint64_t ws = nvmtl_vk_recommended_working_set();
