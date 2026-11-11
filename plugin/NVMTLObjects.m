@@ -1168,15 +1168,24 @@ uint32_t nvmtl_function_spv_fnv(id f)
 uint64_t nvmtl_function_air_key(id f)
 {
     if (![f isKindOfClass:[NVMTLFunction class]]) return 0;
-    NVMTLFunction *fn = f; static char kKey;
+    NVMTLFunction *fn = f; static char kKey, kTextKey;
     NSNumber *h = objc_getAssociatedObject(fn, &kKey);
     if (h) return h.unsignedLongLongValue;
+    // The key depends only on the text, which every function made from one library entry shares (VideoToolbox makes a
+    // new specialized function per transfer), so it is also kept on the text: the module is hashed once, not per function.
+    NSString *air = fn->_air;
+    const BOOL onText = air.length >= 4096;
+    if (onText && (h = objc_getAssociatedObject(air, &kTextKey))) {
+        objc_setAssociatedObject(fn, &kKey, h, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return h.unsignedLongLongValue;
+    }
     uint64_t v = 0;
-    if (fn->_air.length) {
-        const char *s = fn->_air.UTF8String; unsigned char dg[CC_SHA256_DIGEST_LENGTH];
+    if (air.length) {
+        const char *s = air.UTF8String; unsigned char dg[CC_SHA256_DIGEST_LENGTH];
         CC_SHA256(s, (CC_LONG)strlen(s), dg);
         for (int i = 0; i < 8; i++) v = (v << 8) | dg[i];
     }
+    if (onText) objc_setAssociatedObject(air, &kTextKey, @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(fn, &kKey, @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return v;
 }
@@ -2301,16 +2310,25 @@ static NSArray<NSDictionary *> *nvmtl_air_function_constants(NSString *air, NSUI
         row = [NSRegularExpression regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_[^\\n]*, !\"([^\"]+)\", !\"([^\"]+)\", i32 ([0-9]+), i1 (true|false)\\}$" options:NSRegularExpressionAnchorsMatchLines error:NULL];
         any = [NSRegularExpression regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_" options:NSRegularExpressionAnchorsMatchLines error:NULL];
     });
-    NSMutableArray *out = [NSMutableArray new];
     if (rows) *rows = 0;
-    if (!air.length) return out;
+    if (!air.length) return @[];
+    // Both regular expressions run over the whole module text, and newFunctionWithName:constantValues: asks on every
+    // call (VideoToolbox specializes its scaler per transfer). The answer depends only on the text, so it is kept on it.
+    static char kMemo;
+    const BOOL onText = air.length >= 4096;
+    NSArray *memo = onText ? objc_getAssociatedObject(air, &kMemo) : nil;
+    if (memo.count == 2) { if (rows) *rows = [memo[1] unsignedIntegerValue]; return memo[0]; }
+    NSMutableArray *out = [NSMutableArray new];
     NSRange all = NSMakeRange(0, air.length);
-    if (rows) *rows = [any numberOfMatchesInString:air options:0 range:all];
+    const NSUInteger nrows = [any numberOfMatchesInString:air options:0 range:all];
+    if (rows) *rows = nrows;
     for (NSTextCheckingResult *r in [row matchesInString:air options:0 range:all])
         [out addObject:@{ @"type": [air substringWithRange:[r rangeAtIndex:1]], @"name": [air substringWithRange:[r rangeAtIndex:2]],
                           @"index": @([[air substringWithRange:[r rangeAtIndex:3]] longLongValue]),
                           @"required": @([[air substringWithRange:[r rangeAtIndex:4]] isEqualToString:@"true"]) }];
-    return out;
+    NSArray *answer = [out copy];
+    if (onText) objc_setAssociatedObject(air, &kMemo, @[answer, @(nrows)], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return answer;
 }
 - (NSDictionary<NSString *, MTLFunctionConstant *> *)functionConstantsDictionary {
     static char key;
