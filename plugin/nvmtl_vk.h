@@ -538,6 +538,8 @@ typedef struct { void *mem; void *map; size_t size; uint32_t memtype; int host_v
 int  nvmtl_vk_heap_create(size_t size, int host_visible, nvk_heap *out);
 void nvmtl_vk_image_parked(nvk_image *i);     /* the image went to a park for reuse (alive, recyclable) */
 void nvmtl_vk_image_recycled(nvk_image *i);   /* a parked image was taken back into use */
+uint64_t nvmtl_vk_release_horizon(void);      /* the submit a resource released now must outlive */
+uint64_t nvmtl_vk_finished_seq(void);         /* the newest submit known complete */
 int nvmtl_vk_heap_zero(nvk_heap *h, const char *what);   /* clear a fresh heap to zero before its first placement (NVMTL_HEAP_ZERO) */
 int  nvmtl_vk_format_block(uint32_t vkfmt, uint32_t *bw, uint32_t *bh, uint32_t *block_bytes);
 static inline uint32_t nvmtl_vk_layers_for_type(uint32_t t, uint32_t n) { n = n ? n : 1; return (t == 1 || t == 3 || t == 8) ? n : t == 5 ? 6u : t == 6 ? 6u * n : 1u; }

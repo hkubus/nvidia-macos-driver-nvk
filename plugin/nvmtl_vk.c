@@ -394,6 +394,14 @@ static void nvmtl_image_grace_reap(void)
                   free(e); }
     if (n && (g_grace_reaped & 0xFFF) < n) nvlog("vk: image grace: %llu dead images released so far, %llu still held", (unsigned long long)g_grace_reaped, (unsigned long long)g_grace_n);
 }
+// For pools outside this file that hand a released image to a new owner: the submit a resource released now must outlive
+// (nvmtl_grace_seq_locked), and the newest submit known complete.
+uint64_t nvmtl_vk_release_horizon(void)
+{
+    pthread_mutex_lock(&g_grace_lock); const uint64_t s = nvmtl_grace_seq_locked(); pthread_mutex_unlock(&g_grace_lock);
+    return s;
+}
+uint64_t nvmtl_vk_finished_seq(void) { return __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE); }
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned)
 {
     if (begun) *begun = g_cmd_begun; if (submitted) *submitted = g_cmd_submitted; if (abandoned) *abandoned = g_cmd_abandoned;
