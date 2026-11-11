@@ -137,6 +137,12 @@ D=$B/src/nouveau/vulkan/libvulkan_nouveau.dylib
 U=$(nm -m "$D" | grep '(undefined)' | grep -v weak | grep 'dynamically looked up' || true)
 [ -z "$U" ] || { echo "STOP: unresolved strong references (dlopen fails in WindowServer):"; echo "$U"; exit 5; }
 cp "$D" "$OUT/libvulkan_nouveau.dylib"; strip -S "$OUT/libvulkan_nouveau.dylib"
+# Mesa's dispatch tables name every entry point of every extension; the ones NVK does not implement link as
+# flat-namespace weak imports, and dyld looks each one up in every image of the process before storing NULL: ~2,940
+# lookups, ~80 ms at the start of every process that touches Metal. The slots already hold 0, so the binds are dropped
+# (tools/nvk/drop_flat_weak_binds.py checks that, and that the stream decodes to the same records minus those).
+python3 -I "$HERE/tools/nvk/drop_flat_weak_binds.py" "$OUT/libvulkan_nouveau.dylib" "$OUT/libvulkan_nouveau.nobinds.dylib" \
+  && mv -f "$OUT/libvulkan_nouveau.nobinds.dylib" "$OUT/libvulkan_nouveau.dylib" || { echo "STOP: dropping the flat weak binds failed"; exit 7; }
 nm -gU "$OUT/libvulkan_nouveau.dylib" | awk '{print $3}' | sort > "$OUT/exports.txt"
 UUID=$(otool -l "$OUT/libvulkan_nouveau.dylib" | awk '/uuid/{print $2; exit}')
 echo "release $REL  sha256 $(shasum -a 256 "$OUT/libvulkan_nouveau.dylib" | cut -c1-8)  LC_UUID $UUID  exports $(wc -l < "$OUT/exports.txt")" | tee "$OUT/BUILD.txt"
