@@ -85,7 +85,7 @@ uint64_t nvmtl_resid_for_sampler(id s);
 @interface NVMTLStructType : NVMTLType { @public NSArray *_members; } @end
 @interface NVMTLPointerType : NVMTLType { @public MTLDataType _elem; MTLBindingAccess _access; NSUInteger _align, _size; BOOL _isArgBuf; NVMTLStructType *_elemStruct; } @end
 // an array member of a reflected struct (MTLArrayType): element type, length and stride from the AIR struct_type_info
-@interface NVMTLArrayType : NVMTLType { @public MTLDataType _elem; NSUInteger _len, _stride; } @end
+@interface NVMTLArrayType : NVMTLType { @public MTLDataType _elem; NSUInteger _len, _stride; NVMTLStructType *_elemStruct; } @end
 @interface NVMTLStructMember : NSObject { @public NSString *_name; NSUInteger _offset; MTLDataType _dataType; NSUInteger _argIndex; NVMTLArrayType *_arr;
   NVMTLStructType *_struct; NVMTLTextureReferenceType *_texRef; NVMTLPointerType *_ptr; } @end
 // _type holds MTLArgumentType values in its underlying NSUInteger; MTLBindingType, the replacement, numbers them the same
