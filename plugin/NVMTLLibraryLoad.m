@@ -2393,6 +2393,31 @@ static NSArray<NSString *> *nvmtl_air_tuple_tokens(NSString *line)
     }
     return tok;
 }
+// Answers of scans over one function's AIR text (the visible-function probe, the grid-only test). They depend only on the
+// text and the function name, and the text object is shared: a library's AIR dictionary hands out one string per
+// function for its lifetime (NVMTLLazyAirs keeps what it decoded). VideoToolbox and CMPhoto specialize the same kernel
+// and build a new pipeline for every image tile, so without this both scans ran again over the whole module text for
+// every tile. The answers live on the text object, so they go away with it and another text can never see them. Short
+// texts are not memoized (a tagged-pointer string takes no associated object, and they are cheap to scan).
+static const void *const kNvmtlAirMemoKey = &kNvmtlAirMemoKey;
+static os_unfair_lock gNvmtlAirMemoLock = OS_UNFAIR_LOCK_INIT;
+static NSNumber *nvmtl_air_memo_get(NSString *air, NSString *key)
+{
+    if (air.length < 4096 || !key) return nil;
+    os_unfair_lock_lock(&gNvmtlAirMemoLock);
+    NSNumber *v = [(NSDictionary *)objc_getAssociatedObject(air, kNvmtlAirMemoKey) objectForKey:key];
+    os_unfair_lock_unlock(&gNvmtlAirMemoLock);
+    return v;
+}
+static void nvmtl_air_memo_put(NSString *air, NSString *key, BOOL answer)
+{
+    if (air.length < 4096 || !key) return;
+    os_unfair_lock_lock(&gNvmtlAirMemoLock);
+    NSMutableDictionary *m = objc_getAssociatedObject(air, kNvmtlAirMemoKey);
+    if (!m) { m = [NSMutableDictionary new]; objc_setAssociatedObject(air, kNvmtlAirMemoKey, m, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    m[key] = @(answer);
+    os_unfair_lock_unlock(&gNvmtlAirMemoLock);
+}
 // YES when a kernel cannot tell how its threads are grouped: every argument is a buffer outside threadgroup memory, a
 // texture, a sampler, thread_position_in_grid or threads_per_grid, and the module has no threadgroup memory, barrier,
 // SIMD-group or quad operation and no imageblock. The dispatch may then run the same threads in smaller groups.
@@ -2431,7 +2456,13 @@ static BOOL nvmtl_air_grid_only_scan(NSString *ll, NSString *fname)
 }
 BOOL nvmtl_air_grid_only(NVMTLFunction *fn)
 {
-    return fn ? nvmtl_air_grid_only_scan(fn->_air, fn->_fname) : NO;
+    if (!fn || !fn->_fname.length) return NO;
+    NSString *key = [@"grid:" stringByAppendingString:fn->_fname];
+    NSNumber *memo = nvmtl_air_memo_get(fn->_air, key);
+    if (memo) return memo.boolValue;
+    const BOOL r = nvmtl_air_grid_only_scan(fn->_air, fn->_fname);
+    nvmtl_air_memo_put(fn->_air, key, r);
+    return r;
 }
 
 // One `air.struct_type_info` tuple: members of `i32 offset, i32 size, i32 count, !"type", !"name",
@@ -2975,8 +3006,11 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
                   @"!\"air.visible_function_table\"",
                   @"!\"air.intersection_function_table\""];
     });
+    // Every form contains "_function_table", so one byte-wise search clears the common case. The searches are literal:
+    // the forms are ASCII, and the default (Unicode-aware) comparison cost tens of milliseconds per call on large modules.
+    if ([air rangeOfString:@"_function_table" options:NSLiteralSearch].location == NSNotFound) return NO;
     for (NSString *f in forms)
-        if ([air rangeOfString:f].location != NSNotFound) return YES;
+        if ([air rangeOfString:f options:NSLiteralSearch].location != NSNotFound) return YES;
     return NO;
 }
 
@@ -2990,6 +3024,10 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
 // that cannot answer, so a query that cannot run never reads as "no references".
 BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
 {
+    // Only the translator's own answer is kept: it is final for this text. The message fallback below depends on `why`
+    // and on whether the translator was ready, so it is decided each time.
+    NSNumber *memo = nvmtl_air_memo_get(air, @"vlink");
+    if (memo) return memo.boolValue;
     if (air.length && nvmtl_xlate_ready() && xlate_vrefs) {
         uint8_t *out = NULL; size_t len = 0; char e[256] = {0};
         if (xlate_vrefs(air.UTF8String, &out, &len, e, sizeof e) == 0) {
@@ -2997,8 +3035,11 @@ BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
             xlate_free(out, len);
             // the query lists direct references only; a function that calls through a visible or intersection
             // function table has none, and nvmtl_link_stage links it from the table candidates
-            if ([refs isKindOfClass:[NSArray class]])
-                return [(NSArray *)refs count] > 0 || nvmtl_air_reads_function_table(air);
+            if ([refs isKindOfClass:[NSArray class]]) {
+                const BOOL r = [(NSArray *)refs count] > 0 || nvmtl_air_reads_function_table(air);
+                nvmtl_air_memo_put(air, @"vlink", r);
+                return r;
+            }
         }
     }
     return why && ([why rangeOfString:@"visible function reference"].location != NSNotFound
