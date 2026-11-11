@@ -73,7 +73,28 @@ int nvmtl_vk_lost(void);
 static char gXlateTag[NVMTL_SPVCACHE_TAG_MAX] = "untagged";
 // The translator build alone, without the mode suffixes (-u2, -p5, ...) gXlateTag adds: the stale-entry sweep keys on it.
 static char gXlateBuildTag[NVMTL_SPVCACHE_TAG_MAX] = "untagged";
+static NSString *nvmtl_spvcache_dir(void);
+// The tag is the SHA-256 of the whole translator (15 MB), and reading and hashing it cost ~20 ms in every process that
+// translates a shader, every launch. The digest is kept in the cache folder under the file's identity - device, inode,
+// size, modification and change time - so the same file is hashed once; replacing or rewriting the library changes that
+// identity and the next process hashes it again. The name starts with a dot, so neither the trim nor the stale-entry
+// sweep (which deletes only .c3.spv entries) touches it. A process whose cache folder is not writable hashes as before.
+static NSString *nvmtl_translator_tag_memo_path(const char *path) {
+    struct stat st; NSString *dir = nvmtl_spvcache_dir();
+    if (!dir || stat(path, &st) != 0) return nil;
+    return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@".xlate-tag-%llx-%llx-%llx-%ld.%09ld-%ld.%09ld",
+            (unsigned long long)st.st_dev, (unsigned long long)st.st_ino, (unsigned long long)st.st_size,
+            (long)st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec, (long)st.st_ctimespec.tv_sec, st.st_ctimespec.tv_nsec]];
+}
+static BOOL nvmtl_translator_tag_valid(NSString *s) {
+    if (s.length != 7 + 2 * CC_SHA256_DIGEST_LENGTH || ![s hasPrefix:@"sha256-"]) return NO;
+    for (NSUInteger i = 7; i < s.length; i++) { const unichar c = [s characterAtIndex:i]; if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return NO; }
+    return YES;
+}
 static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capacity) {
+    NSString *memo = nvmtl_translator_tag_memo_path(path);
+    NSString *kept = memo ? [NSString stringWithContentsOfFile:memo encoding:NSASCIIStringEncoding error:nil] : nil;
+    if (nvmtl_translator_tag_valid(kept) && kept.length < capacity) { strlcpy(tag, kept.UTF8String, capacity); return; }
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     CC_SHA256_CTX context; CC_SHA256_Init(&context);
     BOOL complete = fd >= 0; uint8_t buffer[65536];
@@ -92,6 +113,7 @@ static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capac
         char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
         for (size_t i = 0; i < sizeof digest; ++i) snprintf(hex + 2*i, 3, "%02x", digest[i]);
         snprintf(tag, capacity, "sha256-%s", hex);
+        if (memo) [@(tag) writeToFile:memo atomically:YES encoding:NSASCIIStringEncoding error:nil];
     } else {
         snprintf(tag, capacity, "private-%d-%llx", getpid(),
                  (unsigned long long)clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW));
