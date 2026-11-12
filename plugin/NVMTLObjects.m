@@ -1680,6 +1680,14 @@ static bool nvmtl_surfout_import(void) {
     if (on < 0) { const char *u = getenv("NVMTL_SURFOUT_READBACK"); on = !(u && !strcmp(u, "cpu")); }
     return on;
 }
+// The surface's kept pages, for a wrapper about to copy through them that has none yet (nvmtl_host_reuse_on). The caller
+// holds the surface's monitor.
+static void nvmtl_host_pages_adopt(NVMTLTexture *r)
+{
+    if (r->_hostPages.buf || !r->_surf || !nvmtl_host_reuse_on()) return;
+    uint64_t born = 0;
+    (void)nvmtl_vram_keep_get(1, r->_surf, r->_plane, 0, &r->_hostPages, &born);
+}
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
@@ -1701,6 +1709,7 @@ static bool nvmtl_surfout_import(void) {
     int rc = -1;
     if (base && row && nvmtl_surfin_import() && nvmtl_surface_host_importable(r, base)) {
         const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
+        nvmtl_host_pages_adopt(r);
         rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off, &r->_hostPages);
     }
     if (rc) rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
@@ -1768,6 +1777,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     int rc = -1;
     if (base && row && nvmtl_surfout_import() && nvmtl_surface_host_importable(r, base)) {
         const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
+        nvmtl_host_pages_adopt(r);
         rc = nvmtl_vk_image_read_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off, &r->_hostPages);
     }
     if (rc) rc = (base && row) ? nvmtl_vk_image_read(r->_q, &r->_i, base, row) : -1;
