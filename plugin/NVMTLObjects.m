@@ -357,8 +357,24 @@ static NSMutableSet *nvmtl_identity_set(NSUInteger cap) {
 // _mru: objects added lately, each in the set until it is removed (the set retains it, so its address cannot be reused
 // while it is listed). Encoders add the same few buffers, pipelines and samplers draw after draw (Apple's GL rebinds its
 // vertex, index and uniform buffers for every draw), and a hit skips the set's hash lookup.
+// _dm: a direct-mapped cache of members behind the MRU, under the same rule (an address is listed only while the set holds
+// it; every removal and clear drops it). Core Animation binds a new texture per layer and the MRU's 8 entries turn over
+// within a draw or two, so a third of its adds still reached the set's hash lookup for an object already held
+// (CARenderer composite: 759k adds, 407k MRU hits, 265k found in the set, 87k new). NVMTL_RESSET_CACHE=0 keeps the MRU only.
+static int nvmtl_resset_dm_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_RESSET_CACHE"); on = !(e && e[0] == '0');
+        nvlog("resources: command buffer resource sets keep a %d-entry member cache %s (NVMTL_RESSET_CACHE=%s)", NVMTL_RESSET_DM, on ? "ON" : "OFF", e ? e : "unset"); }
+    return on;
+}
+static inline unsigned nvmtl_resset_dm_slot(const void *p)
+{ return (unsigned)((((uint64_t)(uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull) >> 57) & (NVMTL_RESSET_DM - 1); }
+_Static_assert(NVMTL_RESSET_DM == 128, "nvmtl_resset_dm_slot keeps 7 bits");
 - (void)addObject:(id)o { if (!o) return; const void *p = (__bridge const void *)o; os_unfair_lock_lock(&_lk);
     for (unsigned k = 0; k < 8; k++) if (_mru[k] == p) { os_unfair_lock_unlock(&_lk); return; }
+    const int dm = nvmtl_resset_dm_on();
+    if (dm && _dm[nvmtl_resset_dm_slot(p)] == p) { os_unfair_lock_unlock(&_lk); return; }
     // A malloc_size() test used to sit here, meant to catch a freed resource before -member: calls
     // -hash on it. It cannot: a freed object's block normally stays a valid block in the default zone,
     // so malloc_size returns its old size and the test passes - while a tagged pointer, or any object
@@ -369,17 +385,20 @@ static NSMutableSet *nvmtl_identity_set(NSUInteger cap) {
     if (!had) { [_s addObject:o]; member = o; }
     // An equal object need not be the object retained by NSMutableSet. Cache only the retained member's address.
     _mru[_mruNext++ & 7] = (__bridge const void *)member;
+    if (dm) _dm[nvmtl_resset_dm_slot((__bridge const void *)member)] = (__bridge const void *)member;
     os_unfair_lock_unlock(&_lk); if (!had) nvmtl_resref(o, 1); }
 - (void)removeObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk); id member = [_s member:o];
     if (member) [_s removeObject:member];
     for (unsigned k = 0; k < 8; k++) if (_mru[k] == (__bridge const void *)member) _mru[k] = NULL;
+    if (member && _dm[nvmtl_resset_dm_slot((__bridge const void *)member)] == (__bridge const void *)member)
+        _dm[nvmtl_resset_dm_slot((__bridge const void *)member)] = NULL;
     os_unfair_lock_unlock(&_lk); if (member) nvmtl_resref(member, -1); }
 // Clearing, copying and sealing never go through -allObjects. That array is autoreleased into the CALLER's pool, and
 // these run on the app's own commit thread: Geekbench 7 never drains that pool, so every resource a command buffer had
 // ever touched stayed alive, and Super Resolution filled VRAM with 9 MB MPS buffers until allocations were refused.
 // The sets below are owned (+1) and released at the end of scope.
 - (void)removeAllObjects { NSMutableSet *fresh = nvmtl_identity_set(0), *old;
-    os_unfair_lock_lock(&_lk); old = _s; _s = fresh; memset(_mru, 0, sizeof _mru); os_unfair_lock_unlock(&_lk);
+    os_unfair_lock_lock(&_lk); old = _s; _s = fresh; memset(_mru, 0, sizeof _mru); memset(_dm, 0, sizeof _dm); os_unfair_lock_unlock(&_lk);
     for (id o in old) nvmtl_resref(o, -1); }
 - (id)copyWithZone:(NSZone *)z { atomic_fetch_add(&gRes2Tick, 1);
     NVMTLResSet *c = [NVMTLResSet new];
@@ -394,7 +413,7 @@ static NSMutableSet *nvmtl_identity_set(NSUInteger cap) {
 // new owner, so each resource's residency count is unchanged; the new set's -dealloc gives it back.
 - (NVMTLResSet *)nvmtlTakeAll { atomic_fetch_add(&gRes2Tick, 1);
     NVMTLResSet *taken = [NVMTLResSet new]; NSMutableSet *empty = taken->_s;
-    os_unfair_lock_lock(&_lk); taken->_s = _s; _s = empty; memset(_mru, 0, sizeof _mru); os_unfair_lock_unlock(&_lk);
+    os_unfair_lock_lock(&_lk); taken->_s = _s; _s = empty; memset(_mru, 0, sizeof _mru); memset(_dm, 0, sizeof _dm); os_unfair_lock_unlock(&_lk);
     return taken; }
 - (void)dealloc { for (id o in _s) nvmtl_resref(o, -1); }
 @end
