@@ -364,6 +364,12 @@ extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
 int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
 int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
+/* The same copy, submitted without waiting (nvmtl_vk_surfin_async_on): 0 when it is in flight, its handle on the image
+   (finished before a readback, re-upload, park or destroy of the image); done(ctx) runs once it has completed and been
+   finished. Non-zero: nothing was submitted and ctx is still the caller's. */
+int  nvmtl_vk_image_write_host_async(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache,
+                                     void (*done)(void *), void *ctx);
+int  nvmtl_vk_surfin_async_on(void);
 int  nvmtl_vk_image_read_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
 void nvmtl_vk_host_pages_drop(nvk_buffer *cache);
 /* The surface and cookie the next host-page copy on this thread belongs to (cookie 0 = none): lets wrappers of one surface share an import (NVMTL_HOST_PAGES_SHARE=1). */
