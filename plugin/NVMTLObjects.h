@@ -57,7 +57,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
   nvk_buffer _vramBuf; BOOL _vramOn; uint64_t _vramBorn;   // _vramBorn: when _vramBuf was imported (nvmtl_vram_keep_put)
   nvk_image _surfaceLinear;   // Managed IOSurface: shared publication image; _i is its coherent tiled GPU backing
   nvk_buffer _hostPages;   // this surface's pages imported for the host copies (nvmtl_host_pages), kept while they hold
-  uint32_t _sparkKey[8]; BOOL _sparkable;   // a private surface image: parked for the next one of this shape (nvmtl_spark_put)
+  uint32_t _sparkKey[8]; BOOL _sparkable, _sparkPlain;   // a private surface image (or, _sparkPlain, a plain texture): parked for the next one of this shape (nvmtl_ipark_put)
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;

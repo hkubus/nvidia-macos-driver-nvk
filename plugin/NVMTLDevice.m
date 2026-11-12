@@ -923,6 +923,29 @@ static uint64_t nvmtl_rt_gate_working_set(uint64_t ws)
     if (!said++) nvlog("working set: answered %lld MB instead of %llu MB while ray tracing is available (NVMTL_WS_RT_GATE_MB)", floor_mb, (unsigned long long)(ws >> 20));
     return (uint64_t)floor_mb << 20;
 }
+// Image parks (nvmtl_ipark_*): see "Private surface images" in the NVMTLDevice implementation below.
+extern uint64_t (*nvmtl_ipark_drain_hook)(void);   // nvmtl_vk.c: called when VRAM refuses an image
+#define NVMTL_SPARK_N       16
+#define NVMTL_SPARK_IDLE_NS (500ull * 1000 * 1000)
+#define NVMTL_SPARK_BYTES   (256ull << 20)
+#define NVMTL_TPARK_N       64
+#define NVMTL_TPARK_IDLE_NS (2000ull * 1000 * 1000)
+typedef struct { nvk_image img; uint32_t key[8]; uint64_t seq, parked; } nvmtl_spark_t;
+typedef struct {
+    const char *what, *knob; unsigned cap_n; uint64_t idle_ns, cap_bytes; int on;
+    int submitted_only;   // reuse waits for the submits made before the release, not also for command buffers still being encoded
+    nvmtl_spark_t e[NVMTL_TPARK_N]; unsigned n, sweep; uint64_t bytes;
+    unsigned long long hit, miss, parked, evicted, idled, drained;
+    pthread_mutex_t lock;
+} nvmtl_ipark;
+static nvmtl_ipark g_spark = { "private surface image", "NVMTL_SURF_IMAGE_PARK", NVMTL_SPARK_N, NVMTL_SPARK_IDLE_NS, NVMTL_SPARK_BYTES, -1,
+                               .submitted_only = 0,
+                               .lock = PTHREAD_MUTEX_INITIALIZER };
+static nvmtl_ipark g_tpark = { "texture", "NVMTL_TEXTURE_PARK", NVMTL_TPARK_N, NVMTL_TPARK_IDLE_NS, 0, -1, .submitted_only = 1,
+                               .lock = PTHREAD_MUTEX_INITIALIZER };
+static uint64_t nvmtl_ipark_drain_all(void);
+static int nvmtl_ipark_take(nvmtl_ipark *p, const uint32_t key[8], nvk_image *out);
+
 @implementation NVMTLDevice
 @dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, removable, sparseTileSizeInBytes, supportsPlacementSparse;
 + (void)load {
@@ -1524,8 +1547,17 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
         if (wantStex) { static _Atomic unsigned long msw; const unsigned long k = atomic_fetch_add(&msw, 1) + 1;
             if (!(k & (k - 1))) nvlog("newTextureWithDescriptor: %lu multisample texture(s) asked for ShaderWrite - created like Apple (M1/D300 create them); no storage view", k); }
         if (nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED (multisample)"); return nil; }
-    } else
-    if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+    } else {
+        const uint32_t layers = nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth);
+        // a Private texture a GPU pass writes is parked when released (nvmtl_ipark_put): the key is every argument of
+        // the create below, so a parked image is exactly the image it would make
+        const BOOL park = d.storageMode == MTLStorageModePrivate && (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite));
+        const uint32_t key[8] = { (uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)a8 | (uint32_t)wantStex << 8 | (uint32_t)d.textureType << 16,
+                                  (uint32_t)d.mipmapLevelCount, layers, 0x54504b31u /* 'TPK1' */ };
+        if ((!park || nvmtl_ipark_take(&g_tpark, key, &t->_i))
+            && nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, layers, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+        if (park) { memcpy(t->_sparkKey, key, sizeof key); t->_sparkable = YES; t->_sparkPlain = YES; }
+    }
     nvmtl_alloc_ok();
     t->_q = nvmtl_device_queue();
     t->_stex = t->_i.storage == 1;
@@ -1715,92 +1747,131 @@ static void nvmtl_vram_keep_put(int host, IOSurfaceRef surf, NSUInteger plane, n
 // first use (nvmtlSurfaceIn), as it does into a new image. A parked image is reused only once every submit that could
 // still read it at its release has completed, is held at most NVMTL_SPARK_IDLE_NS, and all of them at most
 // NVMTL_SPARK_BYTES. NVMTL_SURF_IMAGE_PARK=0 turns it off.
-#define NVMTL_SPARK_N       16
-#define NVMTL_SPARK_IDLE_NS (500ull * 1000 * 1000)
-#define NVMTL_SPARK_BYTES   (256ull << 20)
-typedef struct { nvk_image img; uint32_t key[8]; uint64_t seq, parked; } nvmtl_spark_t;
-static nvmtl_spark_t g_spark[NVMTL_SPARK_N];
-static unsigned g_spark_n, g_spark_sweep;
-static uint64_t g_spark_bytes;
-static unsigned long long g_spark_hit, g_spark_miss;
-static pthread_mutex_t g_spark_lock = PTHREAD_MUTEX_INITIALIZER;
-static int nvmtl_spark_on(void)
+//
+// Plain textures (newTextureWithDescriptor:) go through a second park of the same kind. CoreAnimation makes and drops a
+// render target for each backdrop capture, blur level and offscreen group, with a new size whenever a window crosses
+// the screen edge: WindowServer's "show desktop" slide made and freed 2-4 a frame. Each costs NVK four RM calls to make
+// (memory, its VA, the image's own VA and its map: ~0.3-0.7 ms) and two to free (~0.2-1.5 ms, the image VA free is the
+// slow one), so the slide spent ~1.4 s of each 14 s on the compositor thread making them and as much again freeing them.
+// Parked, a texture of a shape asked for again costs nothing, and the rest are freed off the frame when they idle out.
+// Only Private textures a GPU pass writes (render target or shader write) are parked: Metal leaves a new texture's
+// contents undefined, and those are the ones every app clears or overwrites before reading. A parked texture is held at
+// most NVMTL_TPARK_IDLE_NS, all of them at most VRAM/32 (64-256 MiB), and an image allocation that VRAM refuses drains
+// both parks before it falls back. NVMTL_TEXTURE_PARK=0 turns it off.
+// When a plain texture may be reused: a command buffer adds every texture it binds, attaches or blits to its resource set
+// and holds it there until the GPU has finished with it (commandBufferWithUnretainedReferences hands out a retaining one),
+// so a texture that dies is named by no command buffer, encoding or in flight. Reuse waits only for the submits already
+// made when it died (work the driver queued for it outside a command buffer); waiting for the command buffers still being
+// encoded too, as the surface park does, held each texture back two frames and halved the reuse in a slide.
+static int nvmtl_ipark_on(nvmtl_ipark *p)
 {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_SURF_IMAGE_PARK"); on = !(e && e[0] == '0');
-        nvlog("private surface images: released ones %s (NVMTL_SURF_IMAGE_PARK=%s)", on ? "are reused" : "are freed", e ?: "unset"); }
-    return on;
+    if (__atomic_load_n(&p->on, __ATOMIC_ACQUIRE) >= 0) return p->on;
+    pthread_mutex_lock(&p->lock);
+    if (p->on < 0) {
+        const char *e = getenv(p->knob);
+        if (!p->cap_bytes) { const uint64_t c = nvmtl_vk_vram_bytes() / 32; p->cap_bytes = c < (64ull << 20) ? 64ull << 20 : c > (256ull << 20) ? 256ull << 20 : c; }
+        nvmtl_ipark_drain_hook = nvmtl_ipark_drain_all;
+        nvlog("%s park: released ones %s, up to %u held for %llu ms, %llu MiB (%s=%s)", p->what, !(e && e[0] == '0') ? "are reused" : "are freed",
+              p->cap_n, (unsigned long long)(p->idle_ns / 1000000), (unsigned long long)(p->cap_bytes >> 20), p->knob, e ?: "unset");
+        __atomic_store_n(&p->on, !(e && e[0] == '0'), __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&p->lock);
+    return p->on;
 }
 // Removes entry k under the lock and hands its image back, to be destroyed outside it.
-static nvk_image nvmtl_spark_take_at(unsigned k)
+static nvk_image nvmtl_ipark_take_at(nvmtl_ipark *p, unsigned k)
 {
-    const nvk_image i = g_spark[k].img;
-    g_spark_bytes -= i.alloc;
-    g_spark[k] = g_spark[--g_spark_n];
+    const nvk_image i = p->e[k].img;
+    p->bytes -= i.alloc;
+    p->e[k] = p->e[--p->n];
     return i;
 }
-static void nvmtl_spark_schedule(void);
-static void nvmtl_spark_sweep(void)
+static void nvmtl_ipark_census(nvmtl_ipark *p, const char *why)
 {
-    nvk_image gone[NVMTL_SPARK_N]; unsigned ng = 0;
+    const unsigned long long n = p->hit + p->miss;
+    if (n >= 4 && (n & (n - 1))) return;
+    nvlog("%s park (%s): %llu reused, %llu made, %llu parked, %llu evicted, %llu idled out, %llu drained; %u held, %llu MiB",
+          p->what, why, p->hit, p->miss, p->parked, p->evicted, p->idled, p->drained, p->n, (unsigned long long)(p->bytes >> 20));
+}
+static void nvmtl_ipark_schedule(nvmtl_ipark *p);
+static void nvmtl_ipark_sweep(nvmtl_ipark *p)
+{
+    nvk_image gone[NVMTL_TPARK_N]; unsigned ng = 0;
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    pthread_mutex_lock(&g_spark_lock);
-    for (unsigned k = 0; k < g_spark_n; ) if (now - g_spark[k].parked >= NVMTL_SPARK_IDLE_NS) gone[ng++] = nvmtl_spark_take_at(k); else k++;
-    const int more = g_spark_n != 0;
-    g_spark_sweep = 0;
-    pthread_mutex_unlock(&g_spark_lock);
+    pthread_mutex_lock(&p->lock);
+    for (unsigned k = 0; k < p->n; ) if (now - p->e[k].parked >= p->idle_ns) gone[ng++] = nvmtl_ipark_take_at(p, k); else k++;
+    const int more = p->n != 0;
+    p->sweep = 0; p->idled += ng;
+    pthread_mutex_unlock(&p->lock);
     for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
-    if (more) nvmtl_spark_schedule();
+    if (more) nvmtl_ipark_schedule(p);
 }
-static void nvmtl_spark_schedule(void)
+static void nvmtl_ipark_schedule(nvmtl_ipark *p)
 {
-    pthread_mutex_lock(&g_spark_lock);
-    const int go = !g_spark_sweep && g_spark_n; if (go) g_spark_sweep = 1;
-    pthread_mutex_unlock(&g_spark_lock);
-    if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_SPARK_IDLE_NS),
-                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_spark_sweep(); });
+    pthread_mutex_lock(&p->lock);
+    const int go = !p->sweep && p->n; if (go) p->sweep = 1;
+    pthread_mutex_unlock(&p->lock);
+    if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)p->idle_ns),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_ipark_sweep(p); });
 }
+// VRAM refused an image: every parked image is freed (nvmtl_vk_alloc_image_mem retries once). Returns the bytes freed.
+static uint64_t nvmtl_ipark_drain(nvmtl_ipark *p)
+{
+    nvk_image gone[NVMTL_TPARK_N]; unsigned ng = 0; uint64_t bytes = 0;
+    pthread_mutex_lock(&p->lock);
+    while (p->n) { gone[ng] = nvmtl_ipark_take_at(p, p->n - 1); if (!gone[ng].sysmem) bytes += gone[ng].alloc; ng++; }
+    p->drained += ng;
+    pthread_mutex_unlock(&p->lock);
+    for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    if (ng) nvlog("%s park: VRAM refused an image - freed the %u parked (%llu MiB)", p->what, ng, (unsigned long long)(bytes >> 20));
+    return bytes;
+}
+static uint64_t nvmtl_ipark_drain_all(void) { return nvmtl_ipark_drain(&g_tpark) + nvmtl_ipark_drain(&g_spark); }
 // A parked image of this shape whose last possible reader has completed: 0 and *out, or -1.
-static int nvmtl_spark_take(const uint32_t key[8], nvk_image *out)
+static int nvmtl_ipark_take(nvmtl_ipark *p, const uint32_t key[8], nvk_image *out)
 {
-    if (!nvmtl_spark_on()) return -1;
+    if (!nvmtl_ipark_on(p)) return -1;
     const uint64_t done = nvmtl_vk_finished_seq();
     int got = -1;
-    pthread_mutex_lock(&g_spark_lock);
-    for (unsigned k = g_spark_n; k-- > 0; ) {
-        if (memcmp(g_spark[k].key, key, sizeof g_spark[k].key) || g_spark[k].seq > done) continue;
-        *out = nvmtl_spark_take_at(k); got = 0; break;
+    pthread_mutex_lock(&p->lock);
+    for (unsigned k = p->n; k-- > 0; ) {
+        if (memcmp(p->e[k].key, key, sizeof p->e[k].key) || p->e[k].seq > done) continue;
+        *out = nvmtl_ipark_take_at(p, k); got = 0; break;
     }
-    if (got) g_spark_miss++; else g_spark_hit++;
-    const unsigned long long hit = g_spark_hit, miss = g_spark_miss;
-    pthread_mutex_unlock(&g_spark_lock);
+    if (got) p->miss++; else p->hit++;
+    nvmtl_ipark_census(p, got ? "made" : "reused");
+    pthread_mutex_unlock(&p->lock);
     // hz_ut caches the hazard mode of the texture that owned the image; the new owner's is decided on its first bind
     if (!got) { out->hz_ut = 0; nvmtl_vk_image_recycled(out); }
-    if (hit + miss < 4 || (hit + miss) % 20000 == 0) nvlog("private surface image %s (%llu reused, %llu made)", got ? "made" : "reused", hit, miss);
     return got;
 }
-// The released private image of a surface wrapper: parked, or destroyed when it cannot be. Clears *img either way.
-static void nvmtl_spark_put(const uint32_t key[8], nvk_image *img)
+// A released image: parked, or destroyed when it cannot be. Clears *img either way.
+static void nvmtl_ipark_put(nvmtl_ipark *p, const uint32_t key[8], nvk_image *img)
 {
     if (!img->img) return;
-    if (!nvmtl_spark_on() || !img->alloc || img->alloc > NVMTL_SPARK_BYTES || img->sparse || img->pool || img->placed) {
+    // never a sparse, pooled or placed image (their memory is not theirs alone), nor one res1/res2 paged out to system memory
+    if (!nvmtl_ipark_on(p) || !img->alloc || img->alloc > p->cap_bytes || img->sparse || img->pool || img->placed || img->sysmem) {
         nvmtl_vk_image_destroy(img); return; }
-    nvmtl_vk_image_upload_barrier(img);   // an async upload into it must land before another surface's copy can
+    nvmtl_vk_image_upload_barrier(img);   // an async upload into it must land before another owner's work can
     nvmtl_vk_image_parked(img);
-    nvmtl_spark_t e = { .img = *img, .seq = nvmtl_vk_release_horizon(), .parked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
+    uint64_t submitted = 0;
+    if (p->submitted_only) nvmtl_vk_cmd_counts(NULL, &submitted, NULL);
+    nvmtl_spark_t e = { .img = *img, .seq = p->submitted_only ? submitted : nvmtl_vk_release_horizon(), .parked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
     memcpy(e.key, key, sizeof e.key);
-    nvk_image gone[NVMTL_SPARK_N]; unsigned ng = 0;
-    pthread_mutex_lock(&g_spark_lock);
-    while (g_spark_n && (g_spark_n == NVMTL_SPARK_N || g_spark_bytes + img->alloc > NVMTL_SPARK_BYTES)) {
-        unsigned o = 0; for (unsigned k = 1; k < g_spark_n; k++) if (g_spark[k].parked < g_spark[o].parked) o = k;
-        gone[ng++] = nvmtl_spark_take_at(o);
+    nvk_image gone[NVMTL_TPARK_N]; unsigned ng = 0;
+    pthread_mutex_lock(&p->lock);
+    while (p->n && (p->n == p->cap_n || p->bytes + img->alloc > p->cap_bytes)) {
+        unsigned o = 0; for (unsigned k = 1; k < p->n; k++) if (p->e[k].parked < p->e[o].parked) o = k;
+        gone[ng++] = nvmtl_ipark_take_at(p, o);
     }
-    g_spark[g_spark_n++] = e; g_spark_bytes += img->alloc;
-    pthread_mutex_unlock(&g_spark_lock);
+    p->e[p->n++] = e; p->bytes += img->alloc; p->parked++; p->evicted += ng;
+    pthread_mutex_unlock(&p->lock);
     memset(img, 0, sizeof *img);
     for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
-    nvmtl_spark_schedule();
+    nvmtl_ipark_schedule(p);
 }
+static int nvmtl_spark_take(const uint32_t key[8], nvk_image *out) { return nvmtl_ipark_take(&g_spark, key, out); }
+static void nvmtl_spark_put(const uint32_t key[8], nvk_image *img) { nvmtl_ipark_put(&g_spark, key, img); }
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
