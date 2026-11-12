@@ -2294,6 +2294,7 @@ static int nvmtl_vk_vram_budget(uint64_t *budget, uint64_t *used)
 }
 static int nvmtl_vk_vram_wall0(uint64_t want, uint64_t *freev_out, uint64_t *bud_out, uint64_t *used_out, int *measured_out);
 uint64_t (*nvmtl_reclaim_hook)(uint64_t need);
+uint64_t (*nvmtl_ipark_drain_hook)(void);   // NVMTLDevice.m: frees the parked images, returns the VRAM bytes freed
 void (*nvmtl_res2_pressure_hook)(uint64_t want);
 uint64_t (*nvmtl_res2_evict_hook)(uint64_t want);
 static uint64_t g_res2_evict_calls, g_res2_evict_won;
@@ -2483,6 +2484,14 @@ static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkDevic
                (unsigned long long)(freev >> 20), what, (unsigned long long)(mr->size >> 20),
                (unsigned long long)(nvmtl_vk_headroom_eff(bud, measured) >> 20), (unsigned long long)(used >> 20),
                (unsigned long long)(bud >> 20), measured ? "measured" : "estimated");
+    // released images the parks hold (NVMTLDevice.m nvmtl_ipark_*) go first: they are VRAM nobody uses
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && nvmtl_ipark_drain_hook && !t_in_reclaim) {
+        t_in_reclaim = 1;
+        const uint64_t freed = nvmtl_ipark_drain_hook();
+        t_in_reclaim = 0;
+        if (freed) { g_budget_stale = 1;
+                     if (!nvmtl_vk_vram_wall(mr->size, &freev, &bud, &used, &measured)) { gate = 0; r = pvkAllocateMemory(g_dev, &mai, NULL, mem); } }
+    }
     if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && nvmtl_res2_evict_hook && !t_in_reclaim && !nvmtl_res2_evict_off()) {
         t_in_reclaim = 1;
         const uint64_t freed = nvmtl_res2_evict_hook(mr->size | (1ull << 63));
