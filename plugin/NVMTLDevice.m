@@ -1700,24 +1700,87 @@ static void nvmtl_vram_keep_schedule(void) {
     if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_VRAM_KEEP_IDLE_NS),
                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_vram_keep_sweep(); });
 }
+// Refresh ahead: the age limit made every surface WindowServer composites import again on the wrapping thread once its
+// import turned two seconds old. A window drag or the "show desktop" slide imports all of them within a few frames, so
+// they also expired within a few frames, every two seconds: 4 ms for each 3440x1440 surface, 12 ms when three met, on a
+// 6 ms frame (the "rare drops while moving windows"). Now a kept import handed out past NVMTL_VRAM_KEEP_REFRESH_NS is
+// imported again on a background queue and parked beside the old one; the next wrapper takes the youngest, and the old
+// import idles out off the frame too. The age limit itself is unchanged. NVMTL_VRAM_REFRESH=0 turns it off.
+#define NVMTL_VRAM_KEEP_REFRESH_NS (1500ull * 1000 * 1000)
+#define NVMTL_VRAM_REFRESH_N 32
+static struct { IOSurfaceRef surf; NSUInteger plane; } g_vram_refreshing[NVMTL_VRAM_REFRESH_N];   // identity only; the job retains
+static unsigned g_vram_refreshing_n;
+static unsigned long long g_vram_refreshed, g_vram_refresh_failed;
+static void nvmtl_vram_keep_put(int host, IOSurfaceRef surf, NSUInteger plane, nvk_buffer *vb, uint64_t born);
+static int nvmtl_vram_refresh_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_VRAM_REFRESH"); on = !(e && e[0] == '0');
+        nvlog("IOSurface import refresh ahead: %s (NVMTL_VRAM_REFRESH=%s)", on ? "imports nearing the age limit are made again off the wrapping thread" : "OFF", e ?: "unset"); }
+    return on;
+}
+static dispatch_queue_t nvmtl_vram_refresh_queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.vram-refresh", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0)); });
+    return q;
+}
+// Under g_vram_kept_lock: 1 when no refresh of (surf, plane) is running and one may start (the caller starts it unlocked).
+static int nvmtl_vram_refresh_claim_locked(IOSurfaceRef surf, NSUInteger plane) {
+    for (unsigned k = 0; k < g_vram_refreshing_n; k++) if (g_vram_refreshing[k].surf == surf && g_vram_refreshing[k].plane == plane) return 0;
+    if (g_vram_refreshing_n == NVMTL_VRAM_REFRESH_N) return 0;
+    g_vram_refreshing[g_vram_refreshing_n].surf = surf; g_vram_refreshing[g_vram_refreshing_n].plane = plane; g_vram_refreshing_n++;
+    return 1;
+}
+static void nvmtl_vram_refresh_start(IOSurfaceRef surf, NSUInteger plane, size_t need) {
+    CFRetain(surf);
+    dispatch_async(nvmtl_vram_refresh_queue(), ^{
+        nvk_buffer vb; const uint64_t born = nvmtl_vram_keep_now();   // taken before the import: it can only expire sooner
+        const int ok = !nvmtl_vk_surface_vram(IOSurfaceGetID(surf), (uint32_t)plane, need, &vb);
+        if (ok) nvmtl_vram_keep_put(0, surf, plane, &vb, born);
+        pthread_mutex_lock(&g_vram_kept_lock);
+        for (unsigned k = 0; k < g_vram_refreshing_n; k++)
+            if (g_vram_refreshing[k].surf == surf && g_vram_refreshing[k].plane == plane) { g_vram_refreshing[k] = g_vram_refreshing[--g_vram_refreshing_n]; break; }
+        if (ok) g_vram_refreshed++; else g_vram_refresh_failed++;
+        const unsigned long long n = g_vram_refreshed, f = g_vram_refresh_failed;
+        pthread_mutex_unlock(&g_vram_kept_lock);
+        if (n + f < 4 || !((n + f) & (n + f - 1)))
+            nvlog("IOSurface VRAM import refreshed ahead of its age limit (%llu made, %llu refused)", n, f);
+        CFRelease(surf);
+    });
+}
 // A kept import of this surface and size, or an import made now. born is the import's time, for nvmtl_vram_keep_put.
 // host: kept surface pages of any size (nvmtl_host_pages checks them), never imported here.
 static int nvmtl_vram_keep_get(int host, IOSurfaceRef surf, NSUInteger plane, size_t need, nvk_buffer *out, uint64_t *born) {
     if (nvmtl_vram_keep_cap()) {
         const uint64_t now = nvmtl_vram_keep_now();
-        nvmtl_vram_kept e = { 0 }, old = { 0 }; int found = 0, stale = 0;
+        enum { NOLD = 8 };
+        nvmtl_vram_kept e = { 0 }, old[NOLD]; unsigned nold = 0; int found = 0, refresh = 0, best = -1;
         pthread_mutex_lock(&g_vram_kept_lock);
-        for (unsigned k = 0; k < g_vram_kept_n; k++) {
-            if (g_vram_kept[k].host != host || g_vram_kept[k].surf != surf || g_vram_kept[k].plane != plane || g_vram_kept[k].need != need) continue;
-            if (now - g_vram_kept[k].born < NVMTL_VRAM_KEEP_AGE_NS &&
-                now - g_vram_kept[k].parked < NVMTL_VRAM_KEEP_IDLE_NS) { e = nvmtl_vram_keep_take_at(k); found = 1; }
-            else { old = nvmtl_vram_keep_take_at(k); stale = 1; }
-            break;
+        // the youngest live import of the surface (a refreshed one sits beside the import it replaces); dead ones go
+        for (unsigned k = 0; k < g_vram_kept_n; ) {
+            if (g_vram_kept[k].host != host || g_vram_kept[k].surf != surf || g_vram_kept[k].plane != plane || g_vram_kept[k].need != need) { k++; continue; }
+            if (now - g_vram_kept[k].born < NVMTL_VRAM_KEEP_AGE_NS && now - g_vram_kept[k].parked < NVMTL_VRAM_KEEP_IDLE_NS) {
+                if (best < 0 || g_vram_kept[k].born > g_vram_kept[best].born) best = (int)k;
+                k++;
+            } else if (nold < NOLD) {
+                const unsigned last = g_vram_kept_n - 1;   // take_at moves the last entry into slot k
+                old[nold++] = nvmtl_vram_keep_take_at(k);
+                if (best == (int)last) best = (int)k;
+            } else k++;
+        }
+        if (best >= 0) {
+            e = nvmtl_vram_keep_take_at((unsigned)best); found = 1;
+            if (!host && now - e.born >= NVMTL_VRAM_KEEP_REFRESH_NS && nvmtl_vram_refresh_on()) refresh = nvmtl_vram_refresh_claim_locked(surf, plane);
         }
         if (!host) { if (found) g_vram_kept_hit++; else g_vram_kept_miss++; }
         const unsigned long long hit = g_vram_kept_hit, miss = g_vram_kept_miss;
         pthread_mutex_unlock(&g_vram_kept_lock);
-        if (stale) nvmtl_vram_keep_release(&old);
+        if (refresh) nvmtl_vram_refresh_start(surf, plane, need);
+        if (nold && !host && nvmtl_vram_refresh_on()) {   // dead imports are released off the wrapping thread
+            nvmtl_vram_kept *gone = malloc(nold * sizeof *gone);
+            if (gone) { memcpy(gone, old, nold * sizeof *gone); const unsigned ng = nold; nold = 0;
+                dispatch_async(nvmtl_vram_refresh_queue(), ^{ for (unsigned k = 0; k < ng; k++) nvmtl_vram_keep_release(&gone[k]); free(gone); }); }
+        }
+        for (unsigned k = 0; k < nold; k++) nvmtl_vram_keep_release(&old[k]);
         if (!host) { static _Atomic unsigned n; const unsigned count = atomic_fetch_add(&n, 1);
             if (count < 4 || count % 20000 == 0) nvlog("IOSurface VRAM import %s (%llu reused, %llu imported)", found ? "reused" : "missed", hit, miss); }
         if (found) { *out = e.vb; *born = e.born; CFRelease(e.surf); return 0; }
