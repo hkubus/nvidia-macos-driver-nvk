@@ -303,13 +303,42 @@ static int nvmtl_skip_empty_on(void) {
     return on;
 }
 
+// The busy-count walk (commit, completion) and the copy-backed-buffer walk (nvmtl_submission_copies) read a sealed
+// part's resource set: one nvmtlTakeAll made, that nothing adds to or removes from again, and that the part (and the
+// command buffer) holds. Fast enumeration of an NVMTLResSet first copies its members into an owned array - a retain,
+// an array insert and a release per member - because an encoder's live set can change under another thread. In
+// WindowServer's anim3 capture that copy was 9 of the 15 main-thread samples under the commit's busy-count raise, and
+// 16 of the 25 execution-worker samples under nvmtl_submission_copies, which the worker runs before a part's
+// vkQueueSubmit and again after a part with copy-backed buffers lands, both on the way to the next "scheduled" the
+// compositor waits for. These walks visit the set in place under its lock; the visitor only reads the member and
+// touches atomics or a local collection, so it never takes another lock. wsloop with 300 extra textures per frame
+// (interleaved, 6 runs each, medians of per-run p50): commit CPU 61.2 -> 54.0 us/frame, blocked in waitUntilScheduled
+// 59.4 -> 52.0 us/frame, composite commit-to-scheduled 30.9 -> 25.0 us. NVMTL_RESSET_DIRECT=0: walk the snapshot.
+static int nvmtl_resset_direct_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_RESSET_DIRECT"); on = !(e && e[0] == '0');
+        nvlog("commit: sealed resource sets are walked %s (NVMTL_RESSET_DIRECT=%s)", on ? "in place under their lock" : "through a snapshot", e ? e : "unset"); }
+    return on;
+}
+static void nvmtl_resset_each(NSSet *set, void (NS_NOESCAPE ^visit)(__unsafe_unretained id o)) {
+    if (!set) return;
+    if (object_getClass(set) == [NVMTLResSet class] && nvmtl_resset_direct_on()) {
+        NVMTLResSet *rs = (NVMTLResSet *)set;
+        os_unfair_lock_lock(&rs->_lk);
+        for (id o in rs->_s) visit(o);
+        os_unfair_lock_unlock(&rs->_lk);
+        return;
+    }
+    for (id o in set) visit(o);
+}
+
 // MTLResourceSPI's isComplete (Apple's OpenGL asks it before it changes a texture from the CPU) answers for command
 // buffers that were committed: a use only encoded does not make a resource busy, and a command buffer that is never
 // committed never holds it. A commit raises the count of every buffer and texture its last part holds - each earlier
 // part's resources are put back into the recording (nvmtlSealPartWithSignal restart), so the last part names them all -
 // on the texture that owns the storage, and on the buffer under a texture made over one, which the GPU reads too.
 static void nvmtl_gpu_uses_adjust(NSSet *resources, int delta) {
-    for (id o in (NVMTLResSet *)resources) {
+    nvmtl_resset_each(resources, ^(__unsafe_unretained id o) {
         NVMTLBuffer *b = nil;
         if ([o isKindOfClass:[NVMTLTexture class]]) {
             NVMTLTexture *t = o, *own = t->_parent ?: t;
@@ -317,7 +346,7 @@ static void nvmtl_gpu_uses_adjust(NSSet *resources, int delta) {
             b = own->_backBuf ?: t->_backBuf;
         } else if ([o isKindOfClass:[NVMTLBuffer class]]) b = o;
         if (b) __atomic_add_fetch(&b->_gpuRefs, delta, __ATOMIC_ACQ_REL);
-    }
+    });
 }
 static void nvmtl_gpu_uses_raise(NVMTLCommandBuffer *cb, NVMTLSubmissionPart *last) {
     if (![last isKindOfClass:[NVMTLSubmissionPart class]] || !last->resources.count) return;
@@ -608,25 +637,26 @@ static void nvmtl_gsub_census(void) {
 // A texture over a copy-backed buffer must refresh the same bytes as a direct
 // buffer binding. Keep direct managed-buffer writeback and copy each backing once.
 static NSArray<NVMTLBuffer *> *nvmtl_submission_copies(NSSet *resources, BOOL writtenOnly) {
-    NSMutableSet<NVMTLBuffer *> *copies = nil;
-    for (id resource in resources) {
-        if ([resource isKindOfClass:[NVMTLHeapPin class]]) {   // a used heap: its members with a host copy
-            NVMTLHeapPin *pin = resource;
-            NSArray *nested = nvmtl_submission_copies([NSSet setWithArray:[pin allCopyCandidates]], writtenOnly);
-            if (nested.count) { if (!copies) copies = [NSMutableSet new]; [copies addObjectsFromArray:nested]; }
-            continue;
-        }
+    __block NSMutableSet<NVMTLBuffer *> *copies = nil;
+    __block NSMutableArray<NVMTLHeapPin *> *pins = nil;
+    nvmtl_resset_each(resources, ^(__unsafe_unretained id resource) {
+        // a used heap: its members with a host copy, gathered after the walk (a heap pin's lists are its own business)
+        if ([resource isKindOfClass:[NVMTLHeapPin class]]) { if (!pins) pins = [NSMutableArray new]; [pins addObject:resource]; return; }
         NVMTLBuffer *buffer = nil;
         if ([resource isKindOfClass:[NVMTLBuffer class]]) buffer = resource;
         else if ([resource isKindOfClass:[NVMTLTexture class]]) {
             NVMTLTexture *texture = resource;
             if (writtenOnly && texture->_usage != MTLTextureUsageUnknown &&
-                !(texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) continue;
+                !(texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) return;
             buffer = texture->_backBuf ?: (texture->_parent ? texture->_parent->_backBuf : nil);
         }
-        if (!buffer || (!buffer->_hostPtr && !buffer->_shadow.map)) continue;
+        if (!buffer || (!buffer->_hostPtr && !buffer->_shadow.map)) return;
         if (!copies) copies = [NSMutableSet new];
         [copies addObject:buffer];
+    });
+    for (NVMTLHeapPin *pin in pins) {
+        NSArray *nested = nvmtl_submission_copies([NSSet setWithArray:[pin allCopyCandidates]], writtenOnly);
+        if (nested.count) { if (!copies) copies = [NSMutableSet new]; [copies addObjectsFromArray:nested]; }
     }
     return copies.allObjects;
 }
