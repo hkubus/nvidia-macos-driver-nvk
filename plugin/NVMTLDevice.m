@@ -1646,7 +1646,8 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 #define NVMTL_VRAM_KEEP_N       192
 #define NVMTL_VRAM_KEEP_IDLE_NS (250ull * 1000 * 1000)
 #define NVMTL_VRAM_KEEP_AGE_NS  (2000ull * 1000 * 1000)
-typedef struct { IOSurfaceRef surf; NSUInteger plane; size_t need; nvk_buffer vb; uint64_t born, parked; int host; } nvmtl_vram_kept;
+// bytes: what the entry adds to g_vram_kept_bytes (a family import's size; 0 for surface pages under nvmtl_host_reuse_on)
+typedef struct { IOSurfaceRef surf; NSUInteger plane; size_t need; nvk_buffer vb; uint64_t born, parked, bytes; int host; } nvmtl_vram_kept;
 static nvmtl_vram_kept g_vram_kept[NVMTL_VRAM_KEEP_N];
 static unsigned g_vram_kept_n, g_vram_kept_sweep;
 static uint64_t g_vram_kept_bytes;
@@ -1670,10 +1671,29 @@ static uint64_t nvmtl_vram_keep_cap(void) {
     return cap;
 }
 static uint64_t nvmtl_vram_keep_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+// Surface pages reused by every wrapper: a CPU-drawn surface (Firefox's software-rendered tiles, any app drawing with
+// CoreGraphics) changes its seed every frame, and WindowServer wraps it in a new texture every frame. Its pages were
+// imported (pinned and GPU-mapped: two RM calls each way) for every upload: only a private image's first wrapper took
+// kept pages, a family-VRAM wrapper never did, so its pages were imported again for each new wrapper and then parked
+// here unused until they idled out, holding the 256 MiB page cap (past it every copy imported and freed its own) and a
+// share of the VRAM budget and its 192 slots. Measured with a 2560x1400 surface the CPU rewrote every frame: 2.7 ms of
+// the 3.0 ms bind went to that import and its release. Now any wrapper about to copy (nvmtlSurfaceIn, nvmtlSurfaceOut)
+// takes the surface's kept pages first. Kept pages are not held to the import age: they are this process's own mapping
+// of a surface the entry holds (so it is neither freed nor unmapped), the pin keeps exactly those pages, and every copy
+// checks they still start at the surface's address with the same length (nvmtl_host_pages). They count against the page
+// cap (NVMTL_HOST_PAGES_MB) instead of the VRAM budget. NVMTL_HOST_PAGES_REUSE=0 turns it off.
+static int nvmtl_host_reuse_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_HOST_PAGES_REUSE"); on = !(e && e[0] == '0');
+        nvlog("surface pages: %s (NVMTL_HOST_PAGES_REUSE=%s)", on ? "every wrapper reuses the kept import" : "only a private image's first wrapper takes a kept import (old)", e ?: "unset"); }
+    return on;
+}
+// The kept entry outlives its import age (nvmtl_host_reuse_on: surface pages are checked at every copy instead).
+static int nvmtl_vram_keep_ageless(const nvmtl_vram_kept *e) { return e->host && nvmtl_host_reuse_on(); }
 // Removes entry k under the lock and hands it back to be released outside it.
 static nvmtl_vram_kept nvmtl_vram_keep_take_at(unsigned k) {
     nvmtl_vram_kept e = g_vram_kept[k];
-    g_vram_kept_bytes -= e.vb.size;
+    g_vram_kept_bytes -= e.bytes;
     g_vram_kept[k] = g_vram_kept[--g_vram_kept_n];
     return e;
 }
@@ -1686,7 +1706,7 @@ static void nvmtl_vram_keep_sweep(void) {
     pthread_mutex_lock(&g_vram_kept_lock);
     for (unsigned k = 0; k < g_vram_kept_n; )
         if (now - g_vram_kept[k].parked >= NVMTL_VRAM_KEEP_IDLE_NS ||
-            now - g_vram_kept[k].born >= NVMTL_VRAM_KEEP_AGE_NS) gone[ng++] = nvmtl_vram_keep_take_at(k); else k++;
+            (!nvmtl_vram_keep_ageless(&g_vram_kept[k]) && now - g_vram_kept[k].born >= NVMTL_VRAM_KEEP_AGE_NS)) gone[ng++] = nvmtl_vram_keep_take_at(k); else k++;
     const int more = g_vram_kept_n != 0;
     g_vram_kept_sweep = 0;
     pthread_mutex_unlock(&g_vram_kept_lock);
@@ -1758,7 +1778,7 @@ static int nvmtl_vram_keep_get(int host, IOSurfaceRef surf, NSUInteger plane, si
         // the youngest live import of the surface (a refreshed one sits beside the import it replaces); dead ones go
         for (unsigned k = 0; k < g_vram_kept_n; ) {
             if (g_vram_kept[k].host != host || g_vram_kept[k].surf != surf || g_vram_kept[k].plane != plane || g_vram_kept[k].need != need) { k++; continue; }
-            if (now - g_vram_kept[k].born < NVMTL_VRAM_KEEP_AGE_NS && now - g_vram_kept[k].parked < NVMTL_VRAM_KEEP_IDLE_NS) {
+            if ((nvmtl_vram_keep_ageless(&g_vram_kept[k]) || now - g_vram_kept[k].born < NVMTL_VRAM_KEEP_AGE_NS) && now - g_vram_kept[k].parked < NVMTL_VRAM_KEEP_IDLE_NS) {
                 if (best < 0 || g_vram_kept[k].born > g_vram_kept[best].born) best = (int)k;
                 k++;
             } else if (nold < NOLD) {
@@ -1795,21 +1815,22 @@ static void nvmtl_vram_keep_put(int host, IOSurfaceRef surf, NSUInteger plane, n
     if (!vb->buf) { memset(vb, 0, sizeof *vb); return; }
     const uint64_t now = nvmtl_vram_keep_now();
     const uint64_t cap = nvmtl_vram_keep_cap();
-    if (!surf || !cap || !vb->size || vb->size > cap || now - born >= NVMTL_VRAM_KEEP_AGE_NS) {
+    nvmtl_vram_kept e = { surf, plane, host ? 0 : vb->size, *vb, born, now, vb->size, host }, gone[NVMTL_VRAM_KEEP_N];
+    if (nvmtl_vram_keep_ageless(&e)) e.bytes = 0;   // held to the page cap, which these pages already count against
+    if (!surf || !cap || !vb->size || vb->size > cap || (!nvmtl_vram_keep_ageless(&e) && now - born >= NVMTL_VRAM_KEEP_AGE_NS)) {
         nvmtl_vram_keep_drop(host, vb); memset(vb, 0, sizeof *vb); return;
     }
-    nvmtl_vram_kept e = { surf, plane, host ? 0 : vb->size, *vb, born, now, host }, gone[NVMTL_VRAM_KEEP_N];
     unsigned ng = 0;
     CFRetain(surf);
     pthread_mutex_lock(&g_vram_kept_lock);
     // Both host-page and family imports hold the surface alive. Bound their combined
     // bytes as well as their count, particularly on small-BAR1 and multi-display systems.
-    while (g_vram_kept_n && (g_vram_kept_n == NVMTL_VRAM_KEEP_N || g_vram_kept_bytes > cap - vb->size)) {
+    while (g_vram_kept_n && (g_vram_kept_n == NVMTL_VRAM_KEEP_N || g_vram_kept_bytes > cap - e.bytes)) {
         unsigned o = 0; for (unsigned k = 1; k < g_vram_kept_n; k++) if (g_vram_kept[k].parked < g_vram_kept[o].parked) o = k;
         gone[ng++] = nvmtl_vram_keep_take_at(o);
     }
     g_vram_kept[g_vram_kept_n++] = e;
-    g_vram_kept_bytes += vb->size;
+    g_vram_kept_bytes += e.bytes;
     pthread_mutex_unlock(&g_vram_kept_lock);
     memset(vb, 0, sizeof *vb);
     for (unsigned k = 0; k < ng; k++) nvmtl_vram_keep_release(&gone[k]);
