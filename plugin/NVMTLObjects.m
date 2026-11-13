@@ -1685,6 +1685,7 @@ static bool nvmtl_surfout_import(void) {
 static void nvmtl_host_pages_adopt(NVMTLTexture *r)
 {
     if (r->_hostPages.buf || !r->_surf || !nvmtl_host_reuse_on()) return;
+    (void)nvmtl_host_warm_on();   // installs the page cap's release of kept pages before the first import
     uint64_t born = 0;
     (void)nvmtl_vram_keep_get(1, r->_surf, r->_plane, 0, &r->_hostPages, &born);
 }

@@ -9501,6 +9501,11 @@ void nvmtl_vk_host_pages_drop(nvk_buffer *cache)
     if (cache->buf) { atomic_fetch_sub(&g_host_pages_kept, (uint64_t)cache->size); nvmtl_vk_buffer_destroy(cache); }
     memset(cache, 0, sizeof *cache);
 }
+// The caller takes cache's import out of the page cap's count and destroys it later itself (nvmtl_vk_buffer_destroy).
+void nvmtl_vk_host_pages_uncount(const nvk_buffer *cache)
+{
+    if (cache && cache->buf) atomic_fetch_sub(&g_host_pages_kept, (uint64_t)cache->size);
+}
 // NVMTL_HOST_PAGES_SHARE=1: wrappers of one surface share one import of its pages (nvmtl_import_cache.h). CoreAnimation
 // wraps the same surfaces in a new texture every frame and each new texture's private cache starts empty, so each frame
 // imported the pages again (two resource-manager calls each way). A lease is found by surface id, size and the cookie
@@ -9550,14 +9555,29 @@ static int nvmtl_hp_lease(void *base, size_t bytes, nvk_buffer *tmp)
     if (kept) t_hp_leased = tmp->buf;
     return 1;
 }
+// Set by the plugin (nvmtl_host_keep_shed): releases at least `bytes` of the surface pages its keep holds for wrappers to
+// come, the longest unused first, or none; returns the bytes released. Kept pages of still windows would otherwise fill
+// the cap and leave every new surface to import and release its pages for each copy. base: the pages wanting the room.
+size_t (*nvmtl_host_pages_shed_hook)(const void *base, size_t bytes);
+static int nvmtl_host_pages_charge(size_t bytes)
+{
+    if (atomic_fetch_add(&g_host_pages_kept, (uint64_t)bytes) + bytes <= nvmtl_host_pages_cap()) return 1;
+    atomic_fetch_sub(&g_host_pages_kept, (uint64_t)bytes);
+    return 0;
+}
+// the bytes past the cap if `bytes` more were kept now
+static size_t nvmtl_host_pages_over(size_t bytes)
+{
+    const uint64_t k = atomic_load(&g_host_pages_kept) + bytes, cap = nvmtl_host_pages_cap();
+    return k > cap ? (size_t)(k - cap) : 0;
+}
 static nvk_buffer *nvmtl_host_pages(nvk_buffer *cache, void *base, size_t bytes, nvk_buffer *tmp)
 {
     if (nvmtl_hp_lease(base, bytes, tmp)) return tmp;
     if (cache && cache->buf && cache->map == base && cache->size == bytes) return cache;
     if (cache && cache->buf) nvmtl_vk_host_pages_drop(cache);   // the surface's pages moved or it was resized
     nvk_buffer *b = tmp;
-    if (cache && atomic_fetch_add(&g_host_pages_kept, (uint64_t)bytes) + bytes <= nvmtl_host_pages_cap()) b = cache;
-    else if (cache) atomic_fetch_sub(&g_host_pages_kept, (uint64_t)bytes);
+    if (cache && (nvmtl_host_pages_charge(bytes) || (nvmtl_host_pages_shed_hook && nvmtl_host_pages_shed_hook(base, nvmtl_host_pages_over(bytes)) && nvmtl_host_pages_charge(bytes)))) b = cache;
     if (nvmtl_vk_buffer_import_host(base, bytes, b)) {
         if (b == cache) atomic_fetch_sub(&g_host_pages_kept, (uint64_t)bytes);
         memset(b, 0, sizeof *b); return NULL;

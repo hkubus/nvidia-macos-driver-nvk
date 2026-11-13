@@ -372,6 +372,8 @@ int  nvmtl_vk_image_write_host_async(nvk_queue *q, nvk_image *img, void *base, s
 int  nvmtl_vk_surfin_async_on(void);
 int  nvmtl_vk_image_read_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
 void nvmtl_vk_host_pages_drop(nvk_buffer *cache);
+void nvmtl_vk_host_pages_uncount(const nvk_buffer *cache);   /* out of the page cap's count; the caller destroys it later */
+extern size_t (*nvmtl_host_pages_shed_hook)(const void *base, size_t bytes);   /* the plugin's: frees at least `bytes` of kept surface pages, or none */
 /* The surface and cookie the next host-page copy on this thread belongs to (cookie 0 = none): lets wrappers of one surface share an import (NVMTL_HOST_PAGES_SHARE=1). */
 void nvmtl_vk_host_pages_key(uint32_t surface_id, uint64_t cookie);
 int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
