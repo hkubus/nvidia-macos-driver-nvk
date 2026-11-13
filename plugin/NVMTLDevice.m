@@ -2407,12 +2407,37 @@ static void nvmtl_ipark_put(nvmtl_ipark *p, const uint32_t key[8], nvk_image *im
 }
 static int nvmtl_spark_take(const uint32_t key[8], nvk_image *out) { return nvmtl_ipark_take(&g_spark, key, out); }
 static void nvmtl_spark_put(const uint32_t key[8], nvk_image *img) { nvmtl_ipark_put(&g_spark, key, img); }
+// A wrapper of PART of a surface (fewer rows, or fewer bytes per row, than the surface holds) gets a private image, copied
+// in and out, instead of the family's VRAM. On the VRAM its copy-in uploads only its part, yet it published the whole
+// surface as current in VRAM (the surface's VRAM tag, and the in-flight upload a later wrapper joins), so a whole-surface
+// wrapper made or used after it skipped its own upload and showed the old rest of the surface: sharetest (src/sharetest.m)
+// check 4c, a 640x180 wrapper beside a 640x360 one after a CPU write, showed rows 180-359 one write old, the same on the
+// base build and with NVMTL_VRAM_SHARE=0 (it predates shared imports). Its GPU writes likewise marked the whole VRAM
+// current. A private image has no VRAM part: its copy-out goes to the surface's pages under IOSurfaceLock, a new seed, so
+// whole-surface wrappers upload the surface again. The cost is a copy per change for such wrappers only; the slide harness
+// (slidebench) and Core Animation's window surfaces wrap whole surfaces (counted: "partial wrapper" in the log).
+// NVMTL_SURF_PARTIAL_VRAM=1 puts partial wrappers on the family VRAM again (old).
+static int nvmtl_surf_partial_vram_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_PARTIAL_VRAM"); on = e && e[0] == '1';
+        nvlog("IOSurface wrappers of part of a surface: %s (NVMTL_SURF_PARTIAL_VRAM=%s)", on ? "on the family VRAM (old)" : "a private image, copied in and out", e ?: "unset"); }
+    return on;
+}
+static int nvmtl_surf_wrap_whole(IOSurfaceRef surf, uint32_t w, uint32_t h, uint32_t bpp) {
+    const size_t ew = IOSurfaceGetElementWidth(surf) ? IOSurfaceGetElementWidth(surf) : 1;
+    const size_t used = (IOSurfaceGetWidth(surf) + ew - 1) / ew * IOSurfaceGetBytesPerElement(surf);   // bytes of a row the surface holds
+    return h == IOSurfaceGetHeight(surf) && (size_t)w * (bpp ? bpp : 4) >= used;
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
-        if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
+        const int whole = nvmtl_surf_wrap_whole(surf, w, h, bpp);
+        if (!whole) { static _Atomic unsigned np; const unsigned c = atomic_fetch_add(&np, 1);
+            if (c < 8 || c % 1000 == 0) nvlog("item 7: partial wrapper #%u: %ux%u of surface %u %zux%zu (row %zu)%s", c + 1, w, h, (unsigned)IOSurfaceGetID(surf),
+                                              IOSurfaceGetWidth(surf), sh, row, nvmtl_surf_partial_vram_on() ? "" : " - a private image"); }
+        if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0 && (whole || nvmtl_surf_partial_vram_on())) {
             nvk_buffer vb; uint64_t born = 0;
             if (!nvmtl_vram_keep_get(0, surf, 0, row * h, &vb, &born)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
@@ -2467,7 +2492,7 @@ private_image:
         nvlog("item 7: surface %u %ux%u plane %lu -> a private image, copied in and out (%s; row %zu bytes, %zu plane(s))",
               (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane,
               (plane != 0 || pplanes > 1) ? "more than one plane" : ((size_t)w * (bpp ? bpp : 4) > prow || h > IOSurfaceGetHeight(surf)) ? "image larger than the surface"
-              : (prow % 32) ? "the row is not a multiple of 32 bytes" : "the family VRAM could not be used", prow, pplanes);
+              : (prow % 32) ? "the row is not a multiple of 32 bytes" : !nvmtl_surf_wrap_whole(surf, w, h, bpp) && !nvmtl_surf_partial_vram_on() ? "a part of the surface" : "the family VRAM could not be used", prow, pplanes);
     }
     // the shape is every argument of the create below, so a parked image is exactly the image it would make
     const uint32_t key[8] = { w, h, vkf, bpp, (uint32_t)a8, (uint32_t)stex, 2u, 1u };
