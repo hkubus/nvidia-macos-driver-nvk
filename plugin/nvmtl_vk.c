@@ -9021,6 +9021,40 @@ int nvmtl_vk_pre_fill(nvk_buffer *b, size_t offset, size_t size, uint32_t word)
     p->n++; p->fills++; p->bytes += size;
     return 0;
 }
+// Clears every level and layer of a colour image to rgba with vkCmdClearColorImage: from its layout (UNDEFINED for one
+// whose contents do not matter) to TRANSFER_DST and on to the layout `to` the encoders already assume for it. Recorded
+// into the pre-submit prologue (nvmtl_vk_pre_clear_image: it lands before the commands of the submit it rides, and so
+// before every later one) or into a command buffer of the caller's (nvmtl_vk_cmd_clear_image_to). For the texture park's
+// recycled render targets (NVMTLObjects.m nvmtl_tpark_zero_flush).
+static int nvmtl_clear_image_rec(VkCommandBuffer cb, nvk_image *img, uint32_t from, uint32_t to, const float rgba[4])
+{
+    if (!cb || !img || !img->img || nvmtl_barrier_aspect(img) != VK_IMAGE_ASPECT_COLOR_BIT || img->bw > 1 || img->bh > 1
+        || to == VK_IMAGE_LAYOUT_UNDEFINED || to == VK_IMAGE_LAYOUT_PREINITIALIZED) return -1;
+    const VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, (VkImageLayout)from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, r };
+    pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    VkClearColorValue v; memcpy(v.float32, rgba, sizeof v.float32);
+    pvkCmdClearColorImage(cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &r);
+    VkImageMemoryBarrier back = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (VkImageLayout)to,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, r };
+    pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &back);
+    return 0;
+}
+int nvmtl_vk_pre_clear_image(nvk_image *img, uint32_t from, uint32_t to, const float rgba[4])
+{
+    nvmtl_prologue *p = g_pre_cur;
+    if (!p || !p->begun) return -1;
+    if (nvmtl_clear_image_rec((VkCommandBuffer)p->cb.cb, img, from, to, rgba)) return -1;
+    p->n++; p->fills++; p->bytes += img->alloc;
+    return 0;
+}
+int nvmtl_vk_cmd_clear_image_to(nvk_cmdbuf *c, nvk_image *img, uint32_t from, uint32_t to, const float rgba[4])
+{
+    return (g_state == 1 && c && c->cb) ? nvmtl_clear_image_rec((VkCommandBuffer)c->cb, img, from, to, rgba) : -1;
+}
 void nvmtl_vk_pre_hold(void *retained)
 {
     nvmtl_prologue *p = g_pre_cur;

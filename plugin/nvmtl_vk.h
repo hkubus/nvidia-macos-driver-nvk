@@ -366,6 +366,8 @@ int nvmtl_vk_pre_open(void);
 int nvmtl_vk_pre_copy(nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int nvmtl_vk_pre_fill(nvk_buffer *b, size_t offset, size_t size, uint32_t word);
 void nvmtl_vk_pre_hold(void *retained);
+int nvmtl_vk_pre_clear_image(nvk_image *img, uint32_t from, uint32_t to, const float rgba[4]);
+int nvmtl_vk_cmd_clear_image_to(nvk_cmdbuf *c, nvk_image *img, uint32_t from, uint32_t to, const float rgba[4]);
 extern void (*nvmtl_pre_release_hook)(void *);
 extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);

@@ -1520,6 +1520,7 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
     nvlog("newTextureWithDescriptor: %lux%lu 4:2:2 format %lu as full-width RGBA8 -> %p", (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (__bridge void *)t);
     return t;
 }
+static void nvmtl_tpark_zero_owe(NVMTLTexture *t, int lent);   // NVMTLObjects.m
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     if (nvmtl_vk_init()) return nil;
     if (d.textureType == MTLTextureTypeTextureBuffer) {
@@ -1566,10 +1567,14 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
         // a shape the park does not hold may be made on the memory of a parked one of another shape (nvmtl_tpark_donor);
         // the lender's image and view come back in shell and are destroyed off this thread
         nvk_image shell = {0};
-        if ((!park || nvmtl_ipark_take(&g_tpark, key, &t->_i))
+        const int recycled = park && !nvmtl_ipark_take(&g_tpark, key, &t->_i);
+        if (!recycled
             && nvmtl_vk_image_create_typed_from((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, layers,
                                                 park ? nvmtl_tpark_donor : NULL, &shell, &t->_i)) { nvmtl_tpark_reap(&shell); nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+        const int lent = shell.img != NULL;   // made on the memory of a parked texture (nvmtl_tpark_donor)
         nvmtl_tpark_reap(&shell);
+        // a recycled or lent target holds its last owner's pixels: cleared to zero before its first use, as a new one reads
+        if (recycled || lent) nvmtl_tpark_zero_owe(t, lent);
         if (park) { memcpy(t->_sparkKey, key, sizeof key); t->_sparkable = YES; t->_sparkPlain = YES; }
     }
     nvmtl_alloc_ok();
@@ -2011,7 +2016,9 @@ static void nvmtl_vram_keep_put_at(int host, IOSurfaceRef surf, NSUInteger plane
 // slow one), so the slide spent ~1.4 s of each 14 s on the compositor thread making them and as much again freeing them.
 // Parked, a texture of a shape asked for again costs nothing, and the rest are freed off the frame when they idle out.
 // Only Private textures a GPU pass writes (render target or shader write) are parked: Metal leaves a new texture's
-// contents undefined, and those are the ones every app clears or overwrites before reading. A parked texture is held at
+// contents undefined, and those are the ones every app clears or overwrites before reading; one handed out again is
+// cleared to zero before its first use all the same, as a new allocation reads (NVMTLObjects.m nvmtl_tpark_zero_owe,
+// NVMTL_TPARK_ZERO=0 turns that off). A parked texture is held at
 // most NVMTL_TPARK_IDLE_NS, all of them at most VRAM/16 (64-512 MiB), and an image allocation that VRAM refuses drains
 // both parks before it falls back. NVMTL_TEXTURE_PARK=0 turns it off.
 // Size of the texture park (NVMTL_TPARK_WIDE=0 restores 64 entries, VRAM/32 capped 64-256 MiB, 2 s): WindowServer's slide
