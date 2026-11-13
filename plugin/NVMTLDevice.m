@@ -1521,6 +1521,28 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
     return t;
 }
 static void nvmtl_tpark_zero_owe(NVMTLTexture *t, int lent);   // NVMTLObjects.m
+// ANGLE's textures go to the texture park too. ANGLE (the WebGL of every browser and Electron app) makes every texture
+// Managed with ShaderRead, ShaderWrite and RenderTarget usage, two of them for a glTexImage2D with data, so a page that
+// makes and drops textures - map tiles and glyph pages while Google Maps loads and zooms - paid NVK's four RM calls to
+// make each and two to free it on its WebGL thread (slow/agents/webglperf/bin/wglbench texnew: 32 new 64x64 textures a
+// frame, ~0.3 ms of process CPU per GL texture, nearly all in RM calls; parked: 13.9 -> 3.4 ms a frame, process CPU
+// 10.5 -> 1.3 ms, medians of 3 interleaved runs, pixels identical). A Managed texture is a GPU image here like a
+// Private one (replaceRegion and getBytes copy through staging), so a parked image of the same key is exactly the image
+// the create would make. Its old contents are what Metal and GL promise for a new texture (undefined), and WebGL's robust
+// resource initialization has ANGLE clear or upload every texture before its first use. Only in a process with ANGLE
+// loaded (nvmtl_browser_gpu_process), decided at its first Managed render-target texture. NVMTL_TPARK_MANAGED=0: not parked.
+static const char *nvmtl_browser_gpu_process(void);
+static int nvmtl_tpark_managed_on(void)
+{
+    static int on = -1;
+    if (__atomic_load_n(&on, __ATOMIC_ACQUIRE) >= 0) return on;
+    const char *e = getenv("NVMTL_TPARK_MANAGED"), *why = nvmtl_browser_gpu_process();
+    const int v = !(e && e[0] == '0') && why != NULL;
+    nvlog("texture park: Managed render-target textures %s (%s, NVMTL_TPARK_MANAGED=%s)", v ? "are parked like Private ones" : "are freed",
+          why ? why : "no ANGLE in this process", e ?: "unset");
+    __atomic_store_n(&on, v, __ATOMIC_RELEASE);
+    return v;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     if (nvmtl_vk_init()) return nil;
     if (d.textureType == MTLTextureTypeTextureBuffer) {
@@ -1561,7 +1583,8 @@ static void nvmtl_tpark_zero_owe(NVMTLTexture *t, int lent);   // NVMTLObjects.m
         const uint32_t layers = nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth);
         // a Private texture a GPU pass writes is parked when released (nvmtl_ipark_put): the key is every argument of
         // the create below, so a parked image is exactly the image it would make
-        const BOOL park = d.storageMode == MTLStorageModePrivate && (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite));
+        const BOOL park = (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))
+            && (d.storageMode == MTLStorageModePrivate || (d.storageMode == MTLStorageModeManaged && nvmtl_tpark_managed_on()));
         const uint32_t key[8] = { (uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)a8 | (uint32_t)wantStex << 8 | (uint32_t)d.textureType << 16,
                                   (uint32_t)d.mipmapLevelCount, layers, 0x54504b31u /* 'TPK1' */ };
         // a shape the park does not hold may be made on the memory of a parked one of another shape (nvmtl_tpark_donor);
