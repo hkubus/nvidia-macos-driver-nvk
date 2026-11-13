@@ -977,7 +977,92 @@ static void nvmtl_zero_flush(void) {
     } else if (todo.count) nvlog("zero-fill: no command buffer for %lu Private clears - they hold what VRAM held", (unsigned long)todo.count);
     gZeroInFlush = 0;
 }
-static void nvmtl_presubmit(void) { @autoreleasepool { nvmtl_zero_flush(); } @autoreleasepool { nvmtl_managed_flush(); } }
+// A render target the texture park hands out again (NVMTLDevice.m nvmtl_ipark_take), or a new one made on the memory of a
+// parked one (nvmtl_tpark_donor), still holds what its last owner drew; before the park (f71c4c51) every one was a new
+// allocation, which RM hands out zeroed (slow/agents/flash/src/freshtest.m: new textures of any shape, and new shapes
+// after white ones were freed, read back 100% zero; the same shapes again through the park read back 100% white). Metal
+// leaves a new texture's contents undefined, but anything that samples texels it did not draw - the padding of an
+// offscreen sized for a shadow or a blur edge, a DontCare pass that draws only part of its target, a mip level it never
+// wrote - saw transparent black before and sees an old frame now: a window, a page, a white square. So a recycled one
+// is cleared to zero again before its first use: the clear rides the pre-submit prologue of the next submit like the
+// owed zero fill of new Private buffers above (no submit and no wait of its own, no work on the creating thread but a
+// table insert), from the layout the encoders know the image in back to that layout (a lent image starts UNDEFINED and
+// is handed out in GENERAL). NVMTL_TPARK_ZERO=0 turns it off; NVMTL_TPARK_ZERO=magenta fills them with opaque magenta
+// instead (a diagnostic: anything that reads undrawn texels of a recycled target shows it).
+// Not shown to fix anything yet: CARenderer scenes like a browser's (resized images with shadows, masks, rounded corners,
+// group opacity, backdrop and blur filters, rasterization, IOSurface tiles; whole frames and update regions only, as
+// WindowServer renders; slow/agents/flash/src/flashca.m) never showed a magenta texel, and their frames are identical
+// with the park off. It puts back what a new texture read before the park, for whatever does read one.
+// Cost (slow/agents/flash/src/parkcost.m, a recycled target drawn with a Load pass and waited for, medians of 300):
+// +0.041 ms for a 3440x1440 BGRA8 target, +0.074 ms RGBA16F, +0.014 ms 800x600, all of it GPU time in the submit's
+// prologue. On the creating thread it is a table insert (medians of 5 interleaved runs under wsemu, previous build / this
+// one / this one with the knob off): churnbench 300 4 3 0 creates 9.3 / 9.9 / 10.8 ms in all; wsreplay 6 2 30 1200 8
+// creates 26.1 / 25.8 / 36.9 ms, render+encode 1.20 / 1.20 / 1.27 ms a frame (noise; the slide recycles ~4 a frame).
+static os_unfair_lock gTZeroLock = OS_UNFAIR_LOCK_INIT;
+static NSMapTable *gTZeroOwed;   // NVMTLTexture (weak) -> @(from layout | to layout << 32)
+static _Atomic int gTZeroAny;
+static __thread int gTZeroInFlush;
+static _Atomic unsigned long long gTZeroN, gTZeroB, gTZeroLent, gTZeroFail;
+static int nvmtl_tpark_zero_mode(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("NVMTL_TPARK_ZERO");
+        m = !e ? 1 : e[0] == '0' ? 0 : strcmp(e, "magenta") == 0 ? 2 : 1;
+        nvlog("texture park: a recycled render target %s (NVMTL_TPARK_ZERO=%s)",
+              m == 1 ? "is cleared to zero before its first use, as a new one reads" : m == 2 ? "is FILLED WITH MAGENTA before its first use (diagnostic)"
+              : "is NOT cleared: it holds its last owner's pixels", e ?: "unset"); }
+    return m;
+}
+static void nvmtl_tpark_zero_census(void) {
+    nvlog("texture park: %llu recycled render targets cleared (%llu MiB, %llu of them on lent memory), %llu not clearable",
+          (unsigned long long)gTZeroN, (unsigned long long)(gTZeroB >> 20), (unsigned long long)gTZeroLent, (unsigned long long)gTZeroFail);
+}
+static void nvmtl_presubmit(void);
+// t holds an image from the park (lent: on a parked one's memory). Called before t is handed to the app.
+static void nvmtl_tpark_zero_owe(NVMTLTexture *t, int lent) {
+    if (!t || !t->_i.img || !nvmtl_tpark_zero_mode()) return;
+    uint32_t from = t->_i.layout, to = from;
+    if (from == VK_IMAGE_LAYOUT_UNDEFINED || from == VK_IMAGE_LAYOUT_PREINITIALIZED) {
+        from = VK_IMAGE_LAYOUT_UNDEFINED; to = VK_IMAGE_LAYOUT_GENERAL;
+        t->_i.layout = VK_IMAGE_LAYOUT_GENERAL;   // what the clear leaves it in; every encoding of t comes after this
+    }
+    if (lent) gTZeroLent++;
+    os_unfair_lock_lock(&gTZeroLock);
+    if (!gTZeroOwed) gTZeroOwed = [NSMapTable weakToStrongObjectsMapTable];
+    @autoreleasepool { [gTZeroOwed setObject:@((uint64_t)from | (uint64_t)to << 32) forKey:t]; }
+    atomic_store(&gTZeroAny, 1);
+    nvmtl_pre_submit_hook = nvmtl_presubmit;
+    os_unfair_lock_unlock(&gTZeroLock);
+}
+static void nvmtl_tpark_zero_flush(void) {
+    if (!atomic_load(&gTZeroAny) || gTZeroInFlush) return;
+    gTZeroInFlush = 1;
+    NSMutableArray *todo = [NSMutableArray new], *how = [NSMutableArray new];
+    os_unfair_lock_lock(&gTZeroLock);
+    for (NVMTLTexture *t in gTZeroOwed.keyEnumerator) { NSNumber *v = [gTZeroOwed objectForKey:t]; if (t && v) { [todo addObject:t]; [how addObject:v]; } }
+    [gTZeroOwed removeAllObjects]; atomic_store(&gTZeroAny, 0);
+    os_unfair_lock_unlock(&gTZeroLock);
+    static const float zero[4] = { 0, 0, 0, 0 }, magenta[4] = { 1, 0, 1, 1 };
+    const float *rgba = nvmtl_tpark_zero_mode() == 2 ? magenta : zero;
+    unsigned n = 0, bad = 0; unsigned long long bytes = 0;
+    nvk_cmdbuf c; int own = 0;
+    const int pre = todo.count && nvmtl_vk_pre_open();
+    if (todo.count && !pre) own = nvmtl_vk_cmd_begin(nvmtl_device_queue(), &c) == 0;
+    for (NSUInteger k = 0; k < todo.count && (pre || own); k++) {
+        NVMTLTexture *t = todo[k]; const uint64_t v = [how[k] unsignedLongLongValue];
+        const int rc = pre ? nvmtl_vk_pre_clear_image(&t->_i, (uint32_t)v, (uint32_t)(v >> 32), rgba)
+                           : nvmtl_vk_cmd_clear_image_to(&c, &t->_i, (uint32_t)v, (uint32_t)(v >> 32), rgba);
+        if (rc) bad++; else { n++; bytes += t->_i.alloc; }
+    }
+    if (pre) { nvmtl_pre_release_hook = nvmtl_pre_release; nvmtl_vk_pre_hold((__bridge_retained void *)todo); }
+    else if (own && nvmtl_vk_submit_wait(&c)) { nvlog("texture park: GPU clear of %u recycled render targets FAILED - they hold their last owner's pixels", n); bad += n; n = 0; bytes = 0; }
+    else if (todo.count && !own) { bad += (unsigned)todo.count; nvlog("texture park: no command buffer for %lu recycled render target clears", (unsigned long)todo.count); }
+    if (n || bad) {
+        const unsigned long long k = atomic_fetch_add(&gTZeroN, n); gTZeroB += bytes; gTZeroFail += bad;
+        if (bad || !k || (k >> 12) != ((k + n) >> 12)) nvmtl_tpark_zero_census();
+    }
+    gTZeroInFlush = 0;
+}
+static void nvmtl_presubmit(void) { @autoreleasepool { nvmtl_tpark_zero_flush(); } @autoreleasepool { nvmtl_zero_flush(); } @autoreleasepool { nvmtl_managed_flush(); } }
 static int nvmtl_mzero_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_MANAGED_EAGER_ZERO"); on = !(e && e[0] == '1');
