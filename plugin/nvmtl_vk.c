@@ -9110,7 +9110,7 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b)
 
 void nvmtl_vk_image_destroy(nvk_image *i)
 {
-    if (g_state != 1 || !i || !i->img) return;
+    if (g_state != 1 || !i || !i->img) { t_fx_dying = NULL; return; }   // a dying label is for this death only
     g_img_gone++;
     if (nvmtl_fx_records_on()) {
         pthread_mutex_lock(&g_sl_lock); nvmtl_im_died(&g_im, i->img, g_cmd_submitted); pthread_mutex_unlock(&g_sl_lock);
