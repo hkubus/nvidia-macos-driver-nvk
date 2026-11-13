@@ -929,14 +929,20 @@ extern uint64_t (*nvmtl_ipark_drain_hook)(void);   // nvmtl_vk.c: called when VR
 #define NVMTL_SPARK_N       16
 #define NVMTL_SPARK_IDLE_NS (500ull * 1000 * 1000)
 #define NVMTL_SPARK_BYTES   (256ull << 20)
-#define NVMTL_TPARK_N       64
-#define NVMTL_TPARK_IDLE_NS (2000ull * 1000 * 1000)
+#define NVMTL_TPARK_N       256   // entries of the texture park (NVMTL_TPARK_WIDE=0: NVMTL_TPARK_N_NARROW)
+#define NVMTL_TPARK_IDLE_NS (4000ull * 1000 * 1000)
+#define NVMTL_TPARK_N_NARROW       64
+#define NVMTL_TPARK_IDLE_NS_NARROW (2000ull * 1000 * 1000)
+#define NVMTL_IPARK_GONE_N  64    // shapes recently evicted or idled out, to tell those misses from new shapes in the census
 typedef struct { nvk_image img; uint32_t key[8]; uint64_t seq, parked; } nvmtl_spark_t;
 typedef struct {
     const char *what, *knob; unsigned cap_n; uint64_t idle_ns, cap_bytes; int on;
     int submitted_only;   // reuse waits for the submits made before the release, not also for command buffers still being encoded
     nvmtl_spark_t e[NVMTL_TPARK_N]; unsigned n, sweep; uint64_t bytes;
     unsigned long long hit, miss, parked, evicted, idled, drained;
+    unsigned long long miss_busy, miss_gone;   // misses: a parked one of that shape still had GPU work queued; the shape was evicted or idled out
+    uint32_t gone_h[NVMTL_IPARK_GONE_N]; unsigned gone_i;
+    uint64_t sweep_ns;   // how often the idle sweep runs while anything is parked (0: idle_ns)
     pthread_mutex_t lock;
 } nvmtl_ipark;
 static nvmtl_ipark g_spark = { "private surface image", "NVMTL_SURF_IMAGE_PARK", NVMTL_SPARK_N, NVMTL_SPARK_IDLE_NS, NVMTL_SPARK_BYTES, -1,
@@ -2011,8 +2017,16 @@ static void nvmtl_vram_keep_put_at(int host, IOSurfaceRef surf, NSUInteger plane
 // Parked, a texture of a shape asked for again costs nothing, and the rest are freed off the frame when they idle out.
 // Only Private textures a GPU pass writes (render target or shader write) are parked: Metal leaves a new texture's
 // contents undefined, and those are the ones every app clears or overwrites before reading. A parked texture is held at
-// most NVMTL_TPARK_IDLE_NS, all of them at most VRAM/32 (64-256 MiB), and an image allocation that VRAM refuses drains
+// most NVMTL_TPARK_IDLE_NS, all of them at most VRAM/16 (64-512 MiB), and an image allocation that VRAM refuses drains
 // both parks before it falls back. NVMTL_TEXTURE_PARK=0 turns it off.
+// Size of the texture park (NVMTL_TPARK_WIDE=0 restores 64 entries, VRAM/32 capped 64-256 MiB, 2 s): WindowServer's slide
+// filled 64 entries and evicted all the time. In a capture of it on the 64-entry park, 154 of the 161 samples on Core
+// Animation's dealloc queue were the eviction loop below freeing parked textures (dealloc+3934 in that build), so a shape
+// asked for again a few frames later had already been freed and was made anew on the compositor thread. A replay of the
+// slide with glass toolbars and blurred sidebars (slow/agents/alloc/src/wsreplay.m) makes ~100 shapes a slide, most of
+// them small; 256 entries took its evictions from 551 to 0 and its RM calls on the creating thread from 3.9 to 1.5 per
+// texture. The idle limit is 4 s, swept every second (a texture lives 4-5 s parked; it was 2-4 s): a user clicking the
+// wallpaper again 2.5 s after the windows slid out found nothing of the first slide left (2% reused), with 4 s 79%.
 // When a plain texture may be reused: a command buffer adds every texture it binds, attaches or blits to its resource set
 // and holds it there until the GPU has finished with it (commandBufferWithUnretainedReferences hands out a retaining one),
 // so a texture that dies is named by no command buffer, encoding or in flight. Reuse waits only for the submits already
@@ -2024,14 +2038,27 @@ static int nvmtl_ipark_on(nvmtl_ipark *p)
     pthread_mutex_lock(&p->lock);
     if (p->on < 0) {
         const char *e = getenv(p->knob);
-        if (!p->cap_bytes) { const uint64_t c = nvmtl_vk_vram_bytes() / 32; p->cap_bytes = c < (64ull << 20) ? 64ull << 20 : c > (256ull << 20) ? 256ull << 20 : c; }
+        int wide = 0;
+        if (p == &g_tpark) {
+            const char *w = getenv("NVMTL_TPARK_WIDE"); wide = !(w && w[0] == '0');
+            if (wide) { p->cap_n = NVMTL_TPARK_N; p->idle_ns = NVMTL_TPARK_IDLE_NS; p->sweep_ns = NVMTL_TPARK_IDLE_NS / 4; }
+            else { p->cap_n = NVMTL_TPARK_N_NARROW; p->idle_ns = NVMTL_TPARK_IDLE_NS_NARROW; p->sweep_ns = 0; }
+        }
+        if (!p->cap_bytes) { const uint64_t c = nvmtl_vk_vram_bytes() / (wide ? 16 : 32), hi = (wide ? 512ull : 256ull) << 20;
+                             p->cap_bytes = c < (64ull << 20) ? 64ull << 20 : c > hi ? hi : c; }
         nvmtl_ipark_drain_hook = nvmtl_ipark_drain_all;
-        nvlog("%s park: released ones %s, up to %u held for %llu ms, %llu MiB (%s=%s)", p->what, !(e && e[0] == '0') ? "are reused" : "are freed",
-              p->cap_n, (unsigned long long)(p->idle_ns / 1000000), (unsigned long long)(p->cap_bytes >> 20), p->knob, e ?: "unset");
+        nvlog("%s park: released ones %s, up to %u held for %llu ms, %llu MiB (%s=%s%s)", p->what, !(e && e[0] == '0') ? "are reused" : "are freed",
+              p->cap_n, (unsigned long long)(p->idle_ns / 1000000), (unsigned long long)(p->cap_bytes >> 20), p->knob, e ?: "unset",
+              p == &g_tpark ? (wide ? ", NVMTL_TPARK_WIDE on" : ", NVMTL_TPARK_WIDE=0") : "");
         __atomic_store_n(&p->on, !(e && e[0] == '0'), __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&p->lock);
     return p->on;
+}
+static uint32_t nvmtl_ipark_key_hash(const uint32_t key[8])
+{
+    uint32_t h = 2166136261u; for (int i = 0; i < 8; i++) h = (h ^ key[i]) * 16777619u;
+    return h | 1u;   // 0 marks an empty slot of the ring
 }
 // Removes entry k under the lock and hands its image back, to be destroyed outside it.
 static nvk_image nvmtl_ipark_take_at(nvmtl_ipark *p, unsigned k)
@@ -2041,24 +2068,37 @@ static nvk_image nvmtl_ipark_take_at(nvmtl_ipark *p, unsigned k)
     p->e[k] = p->e[--p->n];
     return i;
 }
+// The same for an entry evicted or idled out: a later miss of its shape is counted as such (census only).
+static nvk_image nvmtl_ipark_drop_at(nvmtl_ipark *p, unsigned k)
+{
+    p->gone_h[p->gone_i++ % NVMTL_IPARK_GONE_N] = nvmtl_ipark_key_hash(p->e[k].key);
+    return nvmtl_ipark_take_at(p, k);
+}
 static void nvmtl_ipark_census(nvmtl_ipark *p, const char *why)
 {
     const unsigned long long n = p->hit + p->miss;
     if (n >= 4 && (n & (n - 1))) return;
-    nvlog("%s park (%s): %llu reused, %llu made, %llu parked, %llu evicted, %llu idled out, %llu drained; %u held, %llu MiB",
-          p->what, why, p->hit, p->miss, p->parked, p->evicted, p->idled, p->drained, p->n, (unsigned long long)(p->bytes >> 20));
+    nvlog_every("%s park (%s): %llu reused, %llu made (%llu of a shape still in use by the GPU, %llu of one evicted or idled out), "
+                "%llu parked, %llu evicted, %llu idled out, %llu drained; %u held, %llu MiB",
+                p->what, why, p->hit, p->miss, p->miss_busy, p->miss_gone, p->parked, p->evicted, p->idled, p->drained,
+                p->n, (unsigned long long)(p->bytes >> 20));
 }
+#define NVMTL_IPARK_BATCH 16   // images destroyed per lock hold (keeps the arrays below small on dispatch threads)
 static void nvmtl_ipark_schedule(nvmtl_ipark *p);
 static void nvmtl_ipark_sweep(nvmtl_ipark *p)
 {
-    nvk_image gone[NVMTL_TPARK_N]; unsigned ng = 0;
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    pthread_mutex_lock(&p->lock);
-    for (unsigned k = 0; k < p->n; ) if (now - p->e[k].parked >= p->idle_ns) gone[ng++] = nvmtl_ipark_take_at(p, k); else k++;
-    const int more = p->n != 0;
-    p->sweep = 0; p->idled += ng;
-    pthread_mutex_unlock(&p->lock);
-    for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    int more = 0;
+    for (unsigned ng = NVMTL_IPARK_BATCH; ng == NVMTL_IPARK_BATCH; ) {
+        nvk_image gone[NVMTL_IPARK_BATCH]; ng = 0;
+        pthread_mutex_lock(&p->lock);
+        for (unsigned k = 0; k < p->n && ng < NVMTL_IPARK_BATCH; ) if (now - p->e[k].parked >= p->idle_ns) gone[ng++] = nvmtl_ipark_drop_at(p, k); else k++;
+        more = p->n != 0;
+        p->idled += ng;
+        if (ng < NVMTL_IPARK_BATCH) p->sweep = 0;
+        pthread_mutex_unlock(&p->lock);
+        for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    }
     if (more) nvmtl_ipark_schedule(p);
 }
 static void nvmtl_ipark_schedule(nvmtl_ipark *p)
@@ -2066,19 +2106,23 @@ static void nvmtl_ipark_schedule(nvmtl_ipark *p)
     pthread_mutex_lock(&p->lock);
     const int go = !p->sweep && p->n; if (go) p->sweep = 1;
     pthread_mutex_unlock(&p->lock);
-    if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)p->idle_ns),
+    if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(p->sweep_ns ? p->sweep_ns : p->idle_ns)),
                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_ipark_sweep(p); });
 }
 // VRAM refused an image: every parked image is freed (nvmtl_vk_alloc_image_mem retries once). Returns the bytes freed.
 static uint64_t nvmtl_ipark_drain(nvmtl_ipark *p)
 {
-    nvk_image gone[NVMTL_TPARK_N]; unsigned ng = 0; uint64_t bytes = 0;
-    pthread_mutex_lock(&p->lock);
-    while (p->n) { gone[ng] = nvmtl_ipark_take_at(p, p->n - 1); if (!gone[ng].sysmem) bytes += gone[ng].alloc; ng++; }
-    p->drained += ng;
-    pthread_mutex_unlock(&p->lock);
-    for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
-    if (ng) nvlog("%s park: VRAM refused an image - freed the %u parked (%llu MiB)", p->what, ng, (unsigned long long)(bytes >> 20));
+    uint64_t bytes = 0; unsigned all = 0;
+    for (unsigned ng = NVMTL_IPARK_BATCH; ng == NVMTL_IPARK_BATCH; ) {
+        nvk_image gone[NVMTL_IPARK_BATCH]; ng = 0;
+        pthread_mutex_lock(&p->lock);
+        while (p->n && ng < NVMTL_IPARK_BATCH) { gone[ng] = nvmtl_ipark_drop_at(p, p->n - 1); if (!gone[ng].sysmem) bytes += gone[ng].alloc; ng++; }
+        p->drained += ng;
+        pthread_mutex_unlock(&p->lock);
+        for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+        all += ng;
+    }
+    if (all) nvlog("%s park: VRAM refused an image - freed the %u parked (%llu MiB)", p->what, all, (unsigned long long)(bytes >> 20));
     return bytes;
 }
 static uint64_t nvmtl_ipark_drain_all(void) { return nvmtl_ipark_drain(&g_tpark) + nvmtl_ipark_drain(&g_spark); }
@@ -2087,13 +2131,18 @@ static int nvmtl_ipark_take(nvmtl_ipark *p, const uint32_t key[8], nvk_image *ou
 {
     if (!nvmtl_ipark_on(p)) return -1;
     const uint64_t done = nvmtl_vk_finished_seq();
-    int got = -1;
+    int got = -1, busy = 0;
     pthread_mutex_lock(&p->lock);
     for (unsigned k = p->n; k-- > 0; ) {
-        if (memcmp(p->e[k].key, key, sizeof p->e[k].key) || p->e[k].seq > done) continue;
+        if (memcmp(p->e[k].key, key, sizeof p->e[k].key)) continue;
+        if (p->e[k].seq > done) { busy = 1; continue; }
         *out = nvmtl_ipark_take_at(p, k); got = 0; break;
     }
-    if (got) p->miss++; else p->hit++;
+    if (got) {
+        p->miss++;
+        if (busy) p->miss_busy++;
+        else { const uint32_t h = nvmtl_ipark_key_hash(key); for (unsigned i = 0; i < NVMTL_IPARK_GONE_N; i++) if (p->gone_h[i] == h) { p->miss_gone++; break; } }
+    } else p->hit++;
     nvmtl_ipark_census(p, got ? "made" : "reused");
     pthread_mutex_unlock(&p->lock);
     // hz_ut caches the hazard mode of the texture that owned the image; the new owner's is decided on its first bind
@@ -2113,16 +2162,20 @@ static void nvmtl_ipark_put(nvmtl_ipark *p, const uint32_t key[8], nvk_image *im
     if (p->submitted_only) nvmtl_vk_cmd_counts(NULL, &submitted, NULL);
     nvmtl_spark_t e = { .img = *img, .seq = p->submitted_only ? submitted : nvmtl_vk_release_horizon(), .parked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
     memcpy(e.key, key, sizeof e.key);
-    nvk_image gone[NVMTL_TPARK_N]; unsigned ng = 0;
-    pthread_mutex_lock(&p->lock);
-    while (p->n && (p->n == p->cap_n || p->bytes + img->alloc > p->cap_bytes)) {
-        unsigned o = 0; for (unsigned k = 1; k < p->n; k++) if (p->e[k].parked < p->e[o].parked) o = k;
-        gone[ng++] = nvmtl_ipark_take_at(p, o);
-    }
-    p->e[p->n++] = e; p->bytes += img->alloc; p->parked++; p->evicted += ng;
-    pthread_mutex_unlock(&p->lock);
+    const size_t a = img->alloc;
     memset(img, 0, sizeof *img);
-    for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    for (int in = 0; !in; ) {
+        nvk_image gone[NVMTL_IPARK_BATCH]; unsigned ng = 0;
+        pthread_mutex_lock(&p->lock);
+        while (p->n && (p->n >= p->cap_n || p->bytes + a > p->cap_bytes) && ng < NVMTL_IPARK_BATCH) {
+            unsigned o = 0; for (unsigned k = 1; k < p->n; k++) if (p->e[k].parked < p->e[o].parked) o = k;
+            gone[ng++] = nvmtl_ipark_drop_at(p, o);
+        }
+        if (!(p->n && (p->n >= p->cap_n || p->bytes + a > p->cap_bytes))) { p->e[p->n++] = e; p->bytes += a; p->parked++; in = 1; }
+        p->evicted += ng;
+        pthread_mutex_unlock(&p->lock);
+        for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    }
     nvmtl_ipark_schedule(p);
 }
 static int nvmtl_spark_take(const uint32_t key[8], nvk_image *out) { return nvmtl_ipark_take(&g_spark, key, out); }
