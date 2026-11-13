@@ -64,6 +64,12 @@ typedef struct { void *rp; void *pipe; void *layout; int has_depth; uint32_t dfm
     uint32_t gl_uniform_layout, gl_uniform_slot[2], gl_uniform_range[2], gl_uniform_tracked;
     uint32_t db_dyn;   /* the depth bounds test and its range are dynamic state of this pipeline (depth attachment + depthBounds feature) */
     uint32_t view_mask;   /* multiview: the views this pipeline's render pass runs (vertex amplification), 0 for an ordinary pass */
+    /* compute: set-0 buffer bindings 0-31 the final module still reads through a storage-buffer descriptor (address
+       lowering kept them), and those of them it declares NonWritable. A slot of these bound at an offset Vulkan cannot
+       put in a descriptor runs on an aligned copy (nvmtl_vk_bounce_plan). sb_wild: the module may write memory other
+       than those slots (a store through an address, an image write, anything the scan cannot place), so an encoder's
+       kept read-only copies cannot outlive one of its dispatches. */
+    uint32_t sb_desc, sb_ro, sb_wild;
 } nvk_pipeline;
 void nvmtl_vk_pipeline_destroy(nvk_pipeline *p);
 typedef struct { void *pool; nvk_buffer stage; } nvk_queue;
@@ -589,6 +595,21 @@ int nvmtl_vk_cmd_fill_buffer(nvk_cmdbuf *c, nvk_buffer *b, size_t offset, size_t
 int nvmtl_vk_cmd_write_word(nvk_cmdbuf *c, nvk_buffer *b, size_t offset, uint32_t word);
 
 int nvmtl_vk_cmd_copy_buffer(nvk_cmdbuf *c, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
+/* Misaligned storage-buffer descriptors of a compute dispatch (nvmtl_vk.c, "Bounce"): the plan names the groups of
+   slots p reads through a descriptor while they are bound at an offset that is not a multiple of 16; each group is one
+   buffer's bytes from its lowest slot offset to the buffer's end. bounce_in copies a group's bytes from g->base into
+   scratch at soff (16-aligned) and binds its slots there; bounce_bind only binds them, to a copy made earlier whose
+   byte g->base sits at soff; bounce_out copies the group back (unless every slot is read-only; scratch may then be
+   NULL) and rebinds the slots to the app's buffer. slots_hold: a set-0 buffer slot in mask holds the buffer h. */
+typedef struct { void *h; size_t size, base, len; uint32_t slots, ro; size_t off[32]; uint64_t address[32]; } nvmtl_bounce;
+uint32_t nvmtl_vk_bounce_plan(nvk_cmdbuf *c, const nvk_pipeline *p, nvmtl_bounce *out, uint32_t max);
+int nvmtl_vk_bounce_in(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff);
+int nvmtl_vk_bounce_bind(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff);
+int nvmtl_vk_bounce_out(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff);
+int nvmtl_vk_slots_hold(nvk_cmdbuf *c, uint32_t mask, const void *h);
+int nvmtl_vk_bounce_on(void);
+int nvmtl_vk_bounce_keep_on(void);
+void nvmtl_vk_bounce_hit(void);
 
 int nvmtl_vk_cmd_copy_image(nvk_cmdbuf *c, nvk_image *src, uint32_t sx, uint32_t sy,
                         nvk_image *dst, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);

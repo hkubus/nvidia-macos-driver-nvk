@@ -493,6 +493,8 @@ static void nvmtl_gpu_uses_lower(NVMTLCommandBuffer *cb) {
     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
     [_parts addObject:part];
     [_surfDirty removeAllObjects]; [_scratch removeAllObjects];
+    // the bounce scratch went with the part, which frees it when it completes: the next part makes its own
+    _nvBounce = nil; _nvBounceTop = 0;
     // The repeated-setBytes cache points at ring chunks without owning them; the part now owns those chunks and frees
     // them when it completes, which can happen while this command buffer is still being encoded. A cache entry that
     // outlived its chunk was bound and retained again by the next identical setBytes, and the compute encoder's binding
@@ -669,7 +671,7 @@ static BOOL nvmtl_surface_schedule_after_publish(NVMTLCommandBuffer *cb) {
     // buffers it filled, and any resources still listed on it. Apple's command buffers do the same. An app's
     // autorelease pool can keep thousands of finished command buffers alive during a long loop (Geekbench 7 does),
     // and holding these until the command buffer itself died filled VRAM until allocations were refused.
-    [_scratch removeAllObjects]; _e78Ring = nil; _e78RingOff = 0; memset(_g79BRing, 0, sizeof _g79BRing);
+    [_scratch removeAllObjects]; _e78Ring = nil; _e78RingOff = 0; _nvBounce = nil; _nvBounceTop = 0; memset(_g79BRing, 0, sizeof _g79BRing);
     [(NVMTLResSet *)_resources removeAllObjects]; [_stTwins removeAllObjects];
     // Applications may retain completed command buffers. Pending overwrite
     // bookkeeping must not keep their IOSurfaces and VRAM alive indefinitely.
