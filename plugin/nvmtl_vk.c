@@ -2719,11 +2719,25 @@ int nvmtl_vk_image_create_ms_storage(uint32_t w, uint32_t h, uint32_t vkfmt, uin
     t_ms_storage = 0;
     return r;
 }
-static int nvmtl_vk_image_create_typed_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_image *out);
+static int nvmtl_vk_image_create_typed_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers,
+                                                     nvmtl_vk_donor_fn donor, nvk_image *shell, nvk_image *out);
+int nvmtl_vk_image_create_typed_from(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers,
+                                     nvmtl_vk_donor_fn donor, nvk_image *shell, nvk_image *out)
+{
+    nvk_image pending = {0};
+    if (shell) memset(shell, 0, sizeof *shell);
+    int result = nvmtl_vk_image_create_typed_lifetime_body(w, h, vkfmt, bpp, a8, mips, storage, mtl_type, layers, donor, shell, &pending);
+    // -2: the bind to lent memory failed after the image was made (that image is gone again, the lender freed): made the usual way
+    if (result == -2) { memset(&pending, 0, sizeof pending);
+                        result = nvmtl_vk_image_create_typed_lifetime_body(w, h, vkfmt, bpp, a8, mips, storage, mtl_type, layers, NULL, NULL, &pending); }
+    if (result) { nvmtl_failed_image(&pending); memset(out, 0, sizeof *out); }
+    else { nvmtl_commit_image(&pending); *out = pending; }
+    return result;
+}
 int nvmtl_vk_image_create_typed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_image *out)
 {
     nvk_image pending = {0};
-    int result = nvmtl_vk_image_create_typed_lifetime_body(w, h, vkfmt, bpp, a8, mips, storage, mtl_type, layers, &pending);
+    int result = nvmtl_vk_image_create_typed_lifetime_body(w, h, vkfmt, bpp, a8, mips, storage, mtl_type, layers, NULL, NULL, &pending);
     if (result) { nvmtl_failed_image(&pending); memset(out, 0, sizeof *out); }
     else { nvmtl_commit_image(&pending); *out = pending; }
     return result;
@@ -2737,7 +2751,35 @@ static VkComponentMapping nvmtl_a8_mapping(int a8)
     if (a8 == 2) return (VkComponentMapping){ VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_R };
     return (VkComponentMapping){ 0, 0, 0, 0 };
 }
-static int nvmtl_vk_image_create_typed_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_image *out)
+// A new image bound to the memory of a released one (NVMTLDevice.m nvmtl_tpark_donor) instead of a vkAllocateMemory of its own.
+// NVK pays three RM calls for a new VRAM allocation (the memory, its GPU VA and that VA's map: 114 of the 199 samples that
+// WindowServer's compositor thread spent making render targets in a "show desktop" slide) and two more for the image's own
+// VA and map at the bind; this path pays only the bind. The lender is an idle parked image whose GPU work has completed
+// (the park's own rule for handing out a parked image), so its memory has no reader or writer left; the new image starts
+// UNDEFINED like any new image, and every use of it is a later submit on the same in-order queue. The lender's image and
+// view keep their own VA until the caller destroys them (*shell, mem NULL): mapping the same memory at two VAs is harmless
+// while only one of them is used. 0 bound, -1 nothing lent (allocate as usual), -2 the bind failed (the image must be made
+// again: NVK may have given it a VA already).
+static int nvmtl_vk_bind_lent(nvmtl_vk_donor_fn donor, const VkMemoryRequirements *mr, nvk_image *out, nvk_image *shell)
+{
+    const int mt = memtype(mr->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    nvk_image d;
+    if (mt < 0 || mt >= 255 || !shell || donor((uint64_t)mr->size, (uint32_t)mt + 1, &d)) return -1;
+    if (!d.img || !d.mem || d.sysmem || d.placed || d.pool || d.sparse || d.mtype1 != (uint8_t)(mt + 1) || d.alloc < mr->size) {
+        nvlog("vk: a lent image did not fit (alloc %zu, need %llu, type %u/%d) - freed, the new one allocates", d.alloc, (unsigned long long)mr->size, d.mtype1, mt + 1);
+        nvmtl_vk_image_destroy(&d); return -1; }
+    if (pvkBindImageMemory(g_dev, (VkImage)out->img, (VkDeviceMemory)d.mem, 0) != VK_SUCCESS) {
+        nvlog("vk: binding a %ux%u image to lent memory failed - made the usual way", out->w, out->h);
+        nvmtl_vk_image_destroy(&d); return -2; }
+    // the memory's bytes move to the new image (nvmtl_commit_image counts them for it); its budget charge stays with the memory
+    out->mem = d.mem; out->alloc = d.alloc; out->sysmem = 0; out->mtype1 = d.mtype1;
+    g_alloc_bytes -= d.alloc; g_vram_bytes -= d.alloc; g_img_align -= (d.alloc + 65535ull) & ~65535ull;
+    d.mem = NULL; d.alloc = 0; d.mtype1 = 0;
+    *shell = d;
+    return 0;
+}
+static int nvmtl_vk_image_create_typed_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers,
+                                                     nvmtl_vk_donor_fn donor, nvk_image *shell, nvk_image *out)
 {
     if (!layers || (mtl_type < 2 && h != 1) || mtl_type == 4 || mtl_type > 7
         || ((mtl_type == 0 || mtl_type == 2) && layers != 1) || (mtl_type == 5 && layers != 6) || (mtl_type == 6 && layers % 6)) {
@@ -2764,9 +2806,12 @@ static int nvmtl_vk_image_create_typed_lifetime_body(uint32_t w, uint32_t h, uin
         pvkDestroyImage(g_dev, (VkImage)out->img, NULL); out->img = NULL; return -1;
     }
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
-    if (image_pool_bind(out)) {
+    const int lent = donor ? nvmtl_vk_bind_lent(donor, &mr, out, shell) : -1;
+    if (lent == -2) { pvkDestroyImage(g_dev, (VkImage)out->img, NULL); out->img = NULL; return -2; }
+    if (lent && image_pool_bind(out)) {
         VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "colour"), "vkAllocateMemory(image)");
         out->alloc = mr.size;
+        if (!out->sysmem) { const int mt = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); out->mtype1 = mt >= 0 && mt < 255 ? (uint8_t)(mt + 1) : 0; }
         VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory");
     }
     out->alias_a8 = (uint8_t)a8;
@@ -9192,6 +9237,7 @@ int nvmtl_vk_image_reback(nvk_image *i, int to_sysmem, int a8)
     if (to_sysmem) { g_sys_bytes += mr.size; g_sys_align += aligned; g_res1_off++; g_res1_off_b += i->alloc; }
     else { g_vram_bytes += mr.size; g_img_align += aligned; nvmtl_vk_budget_charge(mr.size); g_res1_on++; g_res1_on_b += mr.size; }
     i->alias_a8 = (uint8_t)a8; i->img = img; i->mem = mem; i->view = view; i->alloc = mr.size; i->sysmem = to_sysmem ? 1 : 0; i->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    i->mtype1 = to_sysmem || mt >= 255 ? 0 : (uint8_t)(mt + 1);
     if (nvmtl_fx_records_on()) {
         pthread_mutex_lock(&g_sl_lock);
         nvmtl_im_add(&g_im, img, mem, 0, mr.size, view, i->w, i->h, i->fmt, i->storage, 0, 0, g_cmd_submitted); nvmtl_vw_add(&g_vw, view, img); nvmtl_vw_tic_note(view);
@@ -9310,6 +9356,7 @@ int nvmtl_vk_image_migrate(nvk_image *i, int to_sysmem, int a8, nvk_image *old_o
       if (to_sysmem) { g_sys_bytes += mr.size; g_sys_align += aligned; g_res2_off++; g_res2_off_b += i->alloc; }
       else { g_vram_bytes += mr.size; g_img_align += aligned; nvmtl_vk_budget_charge(mr.size); g_res2_on++; g_res2_on_b += mr.size; } }
     i->alias_a8 = (uint8_t)a8; i->img = img; i->mem = mem; i->view = view; i->alloc = mr.size; i->sysmem = to_sysmem ? 1 : 0; i->layout = (uint32_t)was;
+    i->mtype1 = to_sysmem || mt >= 255 ? 0 : (uint8_t)(mt + 1);
     return 0;
 fail:
     if (view) pvkDestroyImageView(g_dev, view, NULL);

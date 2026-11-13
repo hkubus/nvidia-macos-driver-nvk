@@ -934,12 +934,13 @@ extern uint64_t (*nvmtl_ipark_drain_hook)(void);   // nvmtl_vk.c: called when VR
 #define NVMTL_TPARK_N_NARROW       64
 #define NVMTL_TPARK_IDLE_NS_NARROW (2000ull * 1000 * 1000)
 #define NVMTL_IPARK_GONE_N  64    // shapes recently evicted or idled out, to tell those misses from new shapes in the census
+#define NVMTL_TPARK_LEND_OLDEST 8   // a full texture park lends only from its 8 oldest (the next to be evicted)
 typedef struct { nvk_image img; uint32_t key[8]; uint64_t seq, parked; } nvmtl_spark_t;
 typedef struct {
     const char *what, *knob; unsigned cap_n; uint64_t idle_ns, cap_bytes; int on;
     int submitted_only;   // reuse waits for the submits made before the release, not also for command buffers still being encoded
     nvmtl_spark_t e[NVMTL_TPARK_N]; unsigned n, sweep; uint64_t bytes;
-    unsigned long long hit, miss, parked, evicted, idled, drained;
+    unsigned long long hit, miss, parked, evicted, idled, drained, lent;
     unsigned long long miss_busy, miss_gone;   // misses: a parked one of that shape still had GPU work queued; the shape was evicted or idled out
     uint32_t gone_h[NVMTL_IPARK_GONE_N]; unsigned gone_i;
     uint64_t sweep_ns;   // how often the idle sweep runs while anything is parked (0: idle_ns)
@@ -952,6 +953,8 @@ static nvmtl_ipark g_tpark = { "texture", "NVMTL_TEXTURE_PARK", NVMTL_TPARK_N, N
                                .lock = PTHREAD_MUTEX_INITIALIZER };
 static uint64_t nvmtl_ipark_drain_all(void);
 static int nvmtl_ipark_take(nvmtl_ipark *p, const uint32_t key[8], nvk_image *out);
+static int nvmtl_tpark_donor(uint64_t need, uint32_t mtype1, nvk_image *out);
+static void nvmtl_tpark_reap(nvk_image *shell);
 
 @implementation NVMTLDevice
 @dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, removable, sparseTileSizeInBytes, supportsPlacementSparse;
@@ -1573,8 +1576,13 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
         const BOOL park = d.storageMode == MTLStorageModePrivate && (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite));
         const uint32_t key[8] = { (uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)a8 | (uint32_t)wantStex << 8 | (uint32_t)d.textureType << 16,
                                   (uint32_t)d.mipmapLevelCount, layers, 0x54504b31u /* 'TPK1' */ };
+        // a shape the park does not hold may be made on the memory of a parked one of another shape (nvmtl_tpark_donor);
+        // the lender's image and view come back in shell and are destroyed off this thread
+        nvk_image shell = {0};
         if ((!park || nvmtl_ipark_take(&g_tpark, key, &t->_i))
-            && nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, layers, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+            && nvmtl_vk_image_create_typed_from((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, layers,
+                                                park ? nvmtl_tpark_donor : NULL, &shell, &t->_i)) { nvmtl_tpark_reap(&shell); nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+        nvmtl_tpark_reap(&shell);
         if (park) { memcpy(t->_sparkKey, key, sizeof key); t->_sparkable = YES; t->_sparkPlain = YES; }
     }
     nvmtl_alloc_ok();
@@ -2027,6 +2035,8 @@ static void nvmtl_vram_keep_put_at(int host, IOSurfaceRef surf, NSUInteger plane
 // them small; 256 entries took its evictions from 551 to 0 and its RM calls on the creating thread from 3.9 to 1.5 per
 // texture. The idle limit is 4 s, swept every second (a texture lives 4-5 s parked; it was 2-4 s): a user clicking the
 // wallpaper again 2.5 s after the windows slid out found nothing of the first slide left (2% reused), with 4 s 79%.
+// A texture of a shape the park does not hold may be made on the memory of a parked one the park is about to lose
+// (nvmtl_tpark_donor, NVMTL_TPARK_DONOR=0 turns it off).
 // When a plain texture may be reused: a command buffer adds every texture it binds, attaches or blits to its resource set
 // and holds it there until the GPU has finished with it (commandBufferWithUnretainedReferences hands out a retaining one),
 // so a texture that dies is named by no command buffer, encoding or in flight. Reuse waits only for the submits already
@@ -2079,8 +2089,8 @@ static void nvmtl_ipark_census(nvmtl_ipark *p, const char *why)
     const unsigned long long n = p->hit + p->miss;
     if (n >= 4 && (n & (n - 1))) return;
     nvlog_every("%s park (%s): %llu reused, %llu made (%llu of a shape still in use by the GPU, %llu of one evicted or idled out), "
-                "%llu parked, %llu evicted, %llu idled out, %llu drained; %u held, %llu MiB",
-                p->what, why, p->hit, p->miss, p->miss_busy, p->miss_gone, p->parked, p->evicted, p->idled, p->drained,
+                "%llu on lent memory; %llu parked, %llu evicted, %llu idled out, %llu drained; %u held, %llu MiB",
+                p->what, why, p->hit, p->miss, p->miss_busy, p->miss_gone, p->lent, p->parked, p->evicted, p->idled, p->drained,
                 p->n, (unsigned long long)(p->bytes >> 20));
 }
 #define NVMTL_IPARK_BATCH 16   // images destroyed per lock hold (keeps the arrays below small on dispatch threads)
@@ -2148,6 +2158,67 @@ static int nvmtl_ipark_take(nvmtl_ipark *p, const uint32_t key[8], nvk_image *ou
     // hz_ut caches the hazard mode of the texture that owned the image; the new owner's is decided on its first bind
     if (!got) { out->hz_ut = 0; nvmtl_vk_image_recycled(out); }
     return got;
+}
+// A texture of a shape the park does not hold: a parked texture of another shape may lend it its memory
+// (nvmtl_vk_image_create_typed_from), which saves NVK's vkAllocateMemory (three RM calls: the memory, its VA and the map;
+// 114 of the 199 samples WindowServer's compositor thread spent making render targets in the slide) and, later, that
+// memory's free. The new image still pays its own VA and map at the bind. Only a texture the park is about to lose lends:
+// the park is full (the next release evicts its oldest) and it is one of the NVMTL_TPARK_LEND_OLDEST oldest. Lending
+// more freely took textures that were asked for again. With 300 recurring shapes (slow/agents/alloc/src/churnbench.m
+// mode 1) lending whenever the park was three-quarters full made creates slower than not lending (175 vs 113 ms); on the
+// slide replay's event logs (slow/agents/alloc/tools/lendsim.awk) letting a texture parked for 2 s lend too took 95
+// textures the windows' return trip 2.5 s later wanted (+9% RM calls on the creating thread), while the full-park rule
+// never took one that would have been reused. A lender must also be complete like any parked texture handed out (its
+// seq), of the same memory type, and hold at least what the new image needs and at most twice that + 256 KiB (a much
+// larger one would hold VRAM the new texture never uses). The smallest such one is taken, the older on a tie.
+// NVMTL_TPARK_DONOR=0 turns it off.
+static int nvmtl_tpark_donor_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_TPARK_DONOR"); on = !(e && e[0] == '0');
+        nvlog("texture park: a new shape %s the memory of a parked texture about to be evicted (NVMTL_TPARK_DONOR=%s)", on ? "may take" : "never takes", e ?: "unset"); }
+    return on;
+}
+static int nvmtl_tpark_donor(uint64_t need, uint32_t mtype1, nvk_image *out)
+{
+    nvmtl_ipark *p = &g_tpark;
+    if (!need || !mtype1 || !nvmtl_tpark_donor_on() || !nvmtl_ipark_on(p)) return -1;
+    const uint64_t done = nvmtl_vk_finished_seq(), most = 2 * need + (256u << 10);
+    int got = -1;
+    pthread_mutex_lock(&p->lock);
+    // full: the next release evicts the oldest, so the NVMTL_TPARK_LEND_OLDEST oldest go first anyway
+    if (p->n + 4 >= p->cap_n || p->bytes + need + (p->cap_bytes >> 4) > p->cap_bytes) {
+        uint64_t o[NVMTL_TPARK_LEND_OLDEST]; unsigned no = 0;   // the oldest park times, ascending
+        for (unsigned k = 0; k < p->n; k++) {
+            const uint64_t t = p->e[k].parked; unsigned i = no < NVMTL_TPARK_LEND_OLDEST ? no++ : NVMTL_TPARK_LEND_OLDEST;
+            if (i == NVMTL_TPARK_LEND_OLDEST) { if (t >= o[i - 1]) continue; i--; }
+            while (i > 0 && o[i - 1] > t) { o[i] = o[i - 1]; i--; }
+            o[i] = t;
+        }
+        const uint64_t old_cut = no ? o[no - 1] : 0;
+        unsigned best = UINT_MAX;
+        for (unsigned k = 0; k < p->n; k++) {
+            const nvmtl_spark_t *e = &p->e[k];
+            if (e->parked > old_cut || e->seq > done || e->img.mtype1 != mtype1 || e->img.alloc < need || e->img.alloc > most) continue;
+            if (best == UINT_MAX || e->img.alloc < p->e[best].img.alloc || (e->img.alloc == p->e[best].img.alloc && e->parked < p->e[best].parked)) best = k;
+        }
+        if (best != UINT_MAX) { *out = nvmtl_ipark_take_at(p, best); p->lent++; got = 0; }
+    }
+    pthread_mutex_unlock(&p->lock);
+    return got;
+}
+// The image and view of a texture whose memory went to a new one: destroyed on a queue of their own, off the creating
+// thread (NVK unmaps and frees the image's VA there: two RM calls). The memory is not theirs any more (mem NULL).
+static void nvmtl_tpark_reap_one(void *ctx) { nvk_image *e = ctx; nvmtl_vk_image_destroy(e); free(e); }
+static void nvmtl_tpark_reap(nvk_image *shell)
+{
+    if (!shell->img) return;
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.texture-reap", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    nvk_image *e = malloc(sizeof *e);
+    if (!e || !q) { free(e); nvmtl_vk_image_destroy(shell); return; }
+    *e = *shell; memset(shell, 0, sizeof *shell);
+    dispatch_async_f(q, e, nvmtl_tpark_reap_one);
 }
 // A released image: parked, or destroyed when it cannot be. Clears *img either way.
 static void nvmtl_ipark_put(nvmtl_ipark *p, const uint32_t key[8], nvk_image *img)

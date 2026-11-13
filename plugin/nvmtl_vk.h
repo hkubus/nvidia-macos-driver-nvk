@@ -27,6 +27,7 @@ typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; 
                  uint8_t hz_ut;
                  uint8_t linear; /* buffer alias: 1 = 128-byte aligned, 2 = shadow required even without mixed tiling */
                  uint8_t alias_a8; /* component mapping of the base image view */
+                 uint8_t mtype1;   /* device-local memory type + 1 of the image's own allocation (create_typed, reback, migrate); 0 unknown: never lent to another image */
                  void *sparse; /* optional sparse-image state, alongside the fork alias metadata */
                } nvk_image;   /* hazard model: 0 not yet known, 1 tracked, 2 untracked (Metal hazardTrackingMode) */
 #define NVMTL_NVAR 16
@@ -542,6 +543,13 @@ size_t nvmtl_vk_allocated_bytes(void);
 uint64_t nvmtl_vk_buffer_address(nvk_buffer *b);
 
 int nvmtl_vk_image_create_typed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_image *out);
+/* The same, but a released image of another shape may lend its memory (NVMTLDevice.m nvmtl_tpark_donor): donor(need, mtype1, &d)
+   answers 0 and an idle parked image whose own allocation is at least need bytes of memory type mtype1 - 1. The new image is
+   bound to that memory instead of a new allocation; the lender's image and view, without the memory, come back in *shell
+   for the caller to destroy (nvmtl_vk_image_destroy leaves a NULL mem alone). donor NULL: nvmtl_vk_image_create_typed. */
+typedef int (*nvmtl_vk_donor_fn)(uint64_t need, uint32_t mtype1, nvk_image *out);
+int nvmtl_vk_image_create_typed_from(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers,
+                                     nvmtl_vk_donor_fn donor, nvk_image *shell, nvk_image *out);
 typedef struct { void *mem; void *map; size_t size; uint32_t memtype; int host_visible; } nvk_heap;
 int  nvmtl_vk_heap_create(size_t size, int host_visible, nvk_heap *out);
 void nvmtl_vk_image_parked(nvk_image *i);     /* the image went to a park for reuse (alive, recyclable) */
