@@ -6372,6 +6372,7 @@ static void nvmtl_enc78_census(void) {
 }
 void nvmtl_vk_cmd_barrier_c2c(nvk_cmdbuf *c);
 @interface NVMTLCommandBuffer () { @public NVMTLBuffer *_e78Ring; size_t _e78RingOff; } @end
+@interface NVMTLCommandBuffer () { @public NVMTLBuffer *_nvBounce; size_t _nvBounceTop; } @end   /* the bounce scratch (nvmtl_bounce_in), in _scratch, and its first free byte */
 @interface NVMTLCommandBuffer () { @public BOOL _g79Owed, _g79C2C; NSMutableArray *_g79Sig, *_g79Promised; } @end
 enum { NVMTL_G79_DUPIDX = 32, NVMTL_G79_DUPMAX = 64 };
 @interface NVMTLCommandBuffer () { @public __unsafe_unretained NVMTLBuffer *_g79BRing[NVMTL_G79_DUPIDX]; size_t _g79BOff[NVMTL_G79_DUPIDX];
@@ -6448,6 +6449,10 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 
 #include "nvconv_lib.h"
 @interface NVMTLComputeCommandEncoder () { @public uint8_t _nvcKP[528]; uint32_t _nvcKPLen; uint8_t _nvcCP[272]; uint32_t _nvcCPLen; BOOL _nvcIn; } @end
+/* the encoder's kept read-only bounce copies (nvmtl_bounce_in): buffer h of size bytes, its bytes from base on at soff in s */
+typedef struct { void *h; size_t size, base; __unsafe_unretained NVMTLBuffer *s; size_t soff; } nvmtl_bounce_kept;
+enum { NVMTL_BOUNCE_GROUPS = 8, NVMTL_BOUNCE_KEPT = 16 };
+@interface NVMTLComputeCommandEncoder () { @public nvmtl_bounce_kept _nvbKept[NVMTL_BOUNCE_KEPT]; uint32_t _nvbKeptN; size_t _nvbKeptBytes; BOOL _nvbNoKeep, _nvbFenced; } @end
 static id<MTLComputePipelineState> g_nvc_ps[17];   /* 8..10 tensor-core 3/4/5_s, 11..13 32x32 3/4/5_t, 14..15 split-K 4/5_k, 16 reduce (optional) */
 static NSMutableDictionary *g_nvc_part;            /* split-K partial-sum buffer per layer key */
 #define NVC_NC 4                                   /* candidates: 0 fp32 tiles, 1 tensor cores, 2 32x32 tiles, 3 split-K */
@@ -7088,8 +7093,12 @@ static void nvmtl_zprobe_drain(void) {
     _g79Bar = NO;
     const BOOL firstDispatch = !_e78NDisp;
     _e78NDisp++;
-    if (kind == 0) { nvmtl_vk_barrier_site(firstDispatch ? NVMTL_BARS_FIRST_DISPATCH : NVMTL_BARS_LATER_DISPATCH); nvmtl_vk_cmd_barrier(&_cb->_c); }
+    // the last command recorded is a bounce copy's trailing full barrier (nvmtl_bounce_in), which already orders this
+    // dispatch after everything before it
+    if (_nvbFenced && kind != 2) {}
+    else if (kind == 0) { nvmtl_vk_barrier_site(firstDispatch ? NVMTL_BARS_FIRST_DISPATCH : NVMTL_BARS_LATER_DISPATCH); nvmtl_vk_cmd_barrier(&_cb->_c); }
     else if (kind == 1) nvmtl_vk_cmd_barrier_c2c(&_cb->_c);
+    _nvbFenced = NO;
     if (kind) _e78Loose = YES;
     nvmtl_enc78_count(E78C_DISP, 1); nvmtl_enc78_count(E78C_FULL + kind, 1);
     if (_e78Concurrent) nvmtl_enc78_count(E78C_CONC, 1);
@@ -7117,12 +7126,122 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
     while (out[0] * out[1] * out[2] > 128 && out[2] % 2 == 0) out[2] /= 2;
     while (out[0] * out[1] * out[2] > 128 && out[0] > 32 && out[0] % 2 == 0) out[0] /= 2;
 }
+// Bounce (nvmtl_vk.c): the slots this kernel reads through a storage-buffer descriptor while they are bound at an offset
+// no descriptor can hold are copied into this command buffer's bounce scratch on the GPU and bound there for the
+// dispatch; nvmtl_bounce_out copies them back and binds the app's buffer again. Every copy is fenced by full barriers,
+// so scratch space can be handed out again as soon as the dispatch that used it is recorded; it is allocated upwards
+// from _nvBounceTop, and a new, larger scratch is made when the current one is full (the old one stays in _scratch).
+// A read-only group's copy is KEPT in the encoder (_nvbKept): a later dispatch whose slot names the same buffer at a
+// higher offset with the same residue modulo 16 binds into it without copying. The first copy of a buffer and residue
+// starts at the slot; a second (a lower slot) takes every byte of that residue class, so a third is never needed. After
+// each dispatch nvmtl_bounce_vet forgets the copies of buffers it may have written: all of them when its module may
+// write anything but its descriptor slots (sb_wild), else those of buffers bound in a writable descriptor slot. Work
+// that bypasses the vet (machine-code kernels, GPU-encoded indirect commands, the convolution path) forgets them all, and
+// so does the end of the encoder. A copy can only go stale through a GPU write: the CPU's writes and Managed uploads reach
+// the GPU before the command buffer runs, so they are in the first copy as they would be in the buffer.
+static const size_t kNVMTLBounceKeptMax = (size_t)256 << 20;   // kept copies' bytes per encoder; past it they are made per dispatch
+static void nvmtl_bounce_forget(NVMTLComputeCommandEncoder *enc) {
+    if (!enc || !enc->_nvbKeptN) return;
+    enc->_nvbKeptN = 0; enc->_nvbKeptBytes = 0;
+    if (enc->_cb) enc->_cb->_nvBounceTop = 0;   // no dispatch holds scratch between dispatches; the next copy is fenced
+}
+// need bytes at a 256-aligned offset of the bounce scratch, or nil (the slots then read the dummy, as without the bounce)
+static NVMTLBuffer *nvmtl_bounce_room(NVMTLCommandBuffer *cb, size_t need, size_t *at) {
+    NVMTLBuffer *s = cb->_nvBounce;
+    size_t top = (cb->_nvBounceTop + 255) & ~(size_t)255;
+    if (!s || top > s->_b.size || need > s->_b.size - top) {
+        // room for the copies a dispatch makes after this one (a written group's tail is usually small)
+        const size_t mib = (size_t)1 << 20, want = need + mib;
+        size_t cap = mib; while (cap < want && cap < 64 * mib) cap <<= 1;
+        if (cap < want) cap = (want + mib - 1) & ~(mib - 1);
+        s = [NVMTLBuffer new];
+        if (nvmtl_vk_buffer_create(cap, 0, &s->_b)) {
+            static int said; if (said++ < 8) nvlog("bounce: a %zu-byte scratch buffer could not be made - the unaligned slots read the dummy", cap);
+            return nil;
+        }
+        if (!cb->_scratch) cb->_scratch = [NSMutableArray new];
+        [cb->_scratch addObject:s];
+        cb->_nvBounce = s; top = 0;
+    }
+    *at = top; cb->_nvBounceTop = top + need;
+    return s;
+}
+// gs[k], gso[k]: where group k's copy is (gs nil: no copy, its slots read the dummy); *popS / *popT: the scratch top to
+// return to once the dispatch is recorded (the space of copies that are not kept)
+static uint32_t nvmtl_bounce_in(NVMTLCommandBuffer *cb, NVMTLComputeCommandEncoder *enc, NVMTLComputePipelineState *ps, nvmtl_bounce *g,
+                                __unsafe_unretained NVMTLBuffer **gs, size_t *gso, __unsafe_unretained NVMTLBuffer **popS, size_t *popT) {
+    if (!cb || !ps) return 0;
+    uint32_t n = nvmtl_vk_bounce_plan(&cb->_c, &ps->_p, g, NVMTL_BOUNCE_GROUPS);
+    if (!n) return 0;
+    const int keep = enc && !enc->_nvbNoKeep && nvmtl_vk_bounce_keep_on();
+    BOOL done[NVMTL_BOUNCE_GROUPS] = { NO };
+    for (uint32_t k = 0; k < n; k++) {
+        gs[k] = nil; gso[k] = 0;
+        if (!keep || (g[k].slots & ~g[k].ro)) continue;
+        const size_t res = g[k].base % 16;
+        uint32_t e = 0;
+        for (; e < enc->_nvbKeptN; e++) if (enc->_nvbKept[e].h == g[k].h && enc->_nvbKept[e].size == g[k].size && enc->_nvbKept[e].base % 16 == res) break;
+        nvmtl_bounce_kept *kp = e < enc->_nvbKeptN ? &enc->_nvbKept[e] : NULL;
+        if (kp && kp->base <= g[k].base) {
+            nvmtl_bounce h = g[k]; h.base = kp->base; h.len = h.size - kp->base;
+            if (!nvmtl_vk_bounce_bind(&cb->_c, &h, &kp->s->_b, kp->soff)) { gs[k] = kp->s; gso[k] = kp->soff; done[k] = YES; nvmtl_vk_bounce_hit(); continue; }
+            enc->_nvbKept[e] = enc->_nvbKept[--enc->_nvbKeptN]; kp = NULL;   // could not bind into it: a new copy below
+        }
+        const size_t from = kp ? res : g[k].base, len = g[k].size - from;
+        if ((!kp && enc->_nvbKeptN == NVMTL_BOUNCE_KEPT) || enc->_nvbKeptBytes + len > kNVMTLBounceKeptMax) continue;
+        size_t at; NVMTLBuffer *s = nvmtl_bounce_room(cb, len, &at);
+        if (!s) continue;
+        nvmtl_bounce h = g[k]; h.base = from; h.len = len;
+        done[k] = YES;
+        if (nvmtl_vk_bounce_in(&cb->_c, &h, &s->_b, at)) {
+            static int said; if (said++ < 8) nvlog("bounce: the copy of slots %#x (%zu bytes at +%zu) FAILED - they read the dummy", g[k].slots, h.len, h.base);
+            continue;
+        }
+        enc->_nvbFenced = YES;
+        if (!kp) kp = &enc->_nvbKept[enc->_nvbKeptN++];
+        kp->h = g[k].h; kp->size = g[k].size; kp->base = from; kp->s = s; kp->soff = at;
+        enc->_nvbKeptBytes += len;
+        gs[k] = s; gso[k] = at;
+    }
+    *popS = cb->_nvBounce; *popT = cb->_nvBounceTop;
+    for (uint32_t k = 0; k < n; k++) {
+        if (done[k]) continue;
+        size_t at; NVMTLBuffer *s = nvmtl_bounce_room(cb, g[k].len, &at);
+        if (!s) { g[k].ro = g[k].slots; continue; }   // nothing to carry back; nvmtl_bounce_out still binds the app's buffer again
+        if (nvmtl_vk_bounce_in(&cb->_c, &g[k], &s->_b, at)) {
+            static int said; if (said++ < 8) nvlog("bounce: the copy of slots %#x (%zu bytes at +%zu) FAILED - they read the dummy", g[k].slots, g[k].len, g[k].base);
+            g[k].ro = g[k].slots;
+            continue;
+        }
+        if (enc) enc->_nvbFenced = YES;
+        gs[k] = s; gso[k] = at;
+    }
+    return n;
+}
+static void nvmtl_bounce_out(NVMTLCommandBuffer *cb, const nvmtl_bounce *g, __unsafe_unretained NVMTLBuffer *const *gs, const size_t *gso, uint32_t n,
+                             __unsafe_unretained NVMTLBuffer *popS, size_t popT) {
+    for (uint32_t k = 0; k < n; k++)
+        if (nvmtl_vk_bounce_out(&cb->_c, &g[k], gs[k] ? &gs[k]->_b : NULL, gso[k])) {
+            static int said; if (said++ < 8) nvlog("bounce: copying slots %#x back (%zu bytes at +%zu) FAILED - the kernel's writes to them are lost", g[k].slots, g[k].len, g[k].base);
+        }
+    cb->_nvBounceTop = cb->_nvBounce == popS ? popT : 0;
+}
+// after a dispatch of ps (recorded, its bounce undone): forget the kept copies of buffers it may have written
+static void nvmtl_bounce_vet(NVMTLComputeCommandEncoder *enc, NVMTLComputePipelineState *ps) {
+    if (!enc || !enc->_nvbKeptN) return;
+    if (!ps || ps->_p.sb_wild) { nvmtl_bounce_forget(enc); return; }
+    const uint32_t w = ps->_p.sb_desc & ~ps->_p.sb_ro;
+    if (!w) return;
+    // all of them, not just that buffer's: their scratch space is handed out again only all at once
+    for (uint32_t e = 0; e < enc->_nvbKeptN; e++)
+        if (nvmtl_vk_slots_hold(&enc->_cb->_c, w, enc->_nvbKept[e].h)) { nvmtl_bounce_forget(enc); return; }
+}
 - (void)dispatchThreadgroups:(MTLSize)grid threadsPerThreadgroup:(MTLSize)tg {
     if (_ps && _ps->_sassKernel) {
         int ran = nvmtl_sass_dispatch(self, grid, tg, 0, !_ps->_sassOnly);
-        if (ran) { if (ran > 0 && _cb->_stTwins.count) nvmtl_storage_twins_out(_cb); return; }
+        if (ran) { nvmtl_bounce_forget(self); if (ran > 0 && _cb->_stTwins.count) nvmtl_storage_twins_out(_cb); return; }
     }
-    if (!_nvcIn && nvmtl_nvconv_try(self, grid, tg)) return;
+    if (!_nvcIn && nvmtl_nvconv_try(self, grid, tg)) { nvmtl_bounce_forget(self); return; }
     NVMTLComputePipelineState *selected = [self nvmtlSamplerPipeline];
     if (!selected) { nvlog("dispatch with no valid compute sampler pipeline"); return; }
     uint32_t l[3] = { (uint32_t)tg.width, (uint32_t)tg.height, (uint32_t)tg.depth };
@@ -7132,6 +7251,8 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_);
         nvtrace("DISPATCH %s | threads %ux%ux%u tg %ux%ux%u", (_ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL) ?: "-", t[0], t[1], t[2], l[0], l[1], l[2]);
         nvtrace("  BUFS%s", bufs_); }
+    nvmtl_bounce bg[NVMTL_BOUNCE_GROUPS]; NVMTLBuffer *__unsafe_unretained bgs[NVMTL_BOUNCE_GROUPS]; NVMTLBuffer *__unsafe_unretained bpopS = nil; size_t bso[NVMTL_BOUNCE_GROUPS], bpopT = 0;
+    const uint32_t nb = nvmtl_bounce_in(_cb, self, selected, bg, bgs, bso, &bpopS, &bpopT);
     [self nvmtlE78Barrier:NO];
     if (nvmtl_vendor_dispatch_sass(selected, &_cb->_c, t, l) != 0) {
         uint32_t lr[3]; nvmtl_tg_reshape(_ps, l, lr);
@@ -7140,12 +7261,14 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
         nvmtl_vk_dispatch_key(_ps ? nvmtl_function_spv_fnv(_ps->_function) : 0, _ps ? nvmtl_function_air_key(_ps->_function) : 0);
         nvmtl_vk_cmd_dispatch_threads(&_cb->_c, &selected->_p, t, lr);
     }
+    if (nb) nvmtl_bounce_out(_cb, bg, bgs, bso, nb, bpopS, bpopT);
+    nvmtl_bounce_vet(self, selected);
     if (_cb->_stTwins.count) nvmtl_storage_twins_out(_cb);
 }
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tg {
     if (_ps && _ps->_sassKernel) {
         int ran = nvmtl_sass_dispatch(self, threads, tg, 1, !_ps->_sassOnly);
-        if (ran) { if (ran > 0 && _cb->_stTwins.count) nvmtl_storage_twins_out(_cb); return; }
+        if (ran) { nvmtl_bounce_forget(self); if (ran > 0 && _cb->_stTwins.count) nvmtl_storage_twins_out(_cb); return; }
     }
     NVMTLComputePipelineState *selected = [self nvmtlSamplerPipeline];
     if (!selected) { nvlog("dispatch with no valid compute sampler pipeline"); return; }
@@ -7156,6 +7279,8 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_);
         nvtrace("DISPATCH %s | threads %ux%ux%u tg %ux%ux%u", (_ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL) ?: "-", t[0], t[1], t[2], l[0], l[1], l[2]);
         nvtrace("  BUFS%s", bufs_); }
+    nvmtl_bounce bg[NVMTL_BOUNCE_GROUPS]; NVMTLBuffer *__unsafe_unretained bgs[NVMTL_BOUNCE_GROUPS]; NVMTLBuffer *__unsafe_unretained bpopS = nil; size_t bso[NVMTL_BOUNCE_GROUPS], bpopT = 0;
+    const uint32_t nb = nvmtl_bounce_in(_cb, self, selected, bg, bgs, bso, &bpopS, &bpopT);
     [self nvmtlE78Barrier:NO];
     if (nvmtl_vendor_dispatch_sass(selected, &_cb->_c, t, l) != 0) {
         uint32_t lr[3]; nvmtl_tg_reshape(_ps, l, lr);
@@ -7164,6 +7289,8 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
         nvmtl_vk_dispatch_key(_ps ? nvmtl_function_spv_fnv(_ps->_function) : 0, _ps ? nvmtl_function_air_key(_ps->_function) : 0);
         nvmtl_vk_cmd_dispatch_threads(&_cb->_c, &selected->_p, t, lr);
     }
+    if (nb) nvmtl_bounce_out(_cb, bg, bgs, bso, nb, bpopS, bpopT);
+    nvmtl_bounce_vet(self, selected);
     if (_cb->_stTwins.count) nvmtl_storage_twins_out(_cb);
 }
 - (void)setBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i {
@@ -7192,7 +7319,14 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
 // dispatch is recorded, so every candidate pipeline is tried at the sizes an encoder normally uses (the pipeline's thread execution width,
 // its maximum, and its required size when it has one); a command recorded with any other size does not run, and that is logged.
 // Buffers are the encoder's own bindings, as for draws.
+// A GPU-encoded command's buffers come from its record (patched into the address table), not from the encoder's slots
+// that the bounce plans and vets with: none of these dispatches keeps or finds a kept bounce copy.
 - (void)nvmtlGpuIcb:(NVMTLIndirectCommandBuffer *)b loc:(uint32_t)loc len:(uint32_t)len range:(NVMTLBuffer *)rb offset:(NSUInteger)ro {
+    nvmtl_bounce_forget(self); _nvbNoKeep = YES;
+    [self nvmtlGpuIcbRun:b loc:loc len:len range:rb offset:ro];
+    _nvbNoKeep = NO; nvmtl_bounce_forget(self);
+}
+- (void)nvmtlGpuIcbRun:(NVMTLIndirectCommandBuffer *)b loc:(uint32_t)loc len:(uint32_t)len range:(NVMTLBuffer *)rb offset:(NSUInteger)ro {
     if (!b->_recBuf) return;
     const uint32_t slots = nvmtl_icb_slots(b->_cmds.count);
     NSMutableArray *cands = [NSMutableArray array];
@@ -7327,12 +7461,16 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
     if (!selected) { nvlog("indirect dispatch with no valid compute sampler pipeline"); return; }
     uint32_t l[3] = { (uint32_t)tg.width, (uint32_t)tg.height, (uint32_t)tg.depth };
     if (nvmtl_vk_tg_reject(l, NULL, _ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL, selected->_p.lin)) return;
+    nvmtl_bounce bg[NVMTL_BOUNCE_GROUPS]; NVMTLBuffer *__unsafe_unretained bgs[NVMTL_BOUNCE_GROUPS]; NVMTLBuffer *__unsafe_unretained bpopS = nil; size_t bso[NVMTL_BOUNCE_GROUPS], bpopT = 0;
+    const uint32_t nbg = nvmtl_bounce_in(_cb, self, selected, bg, bgs, bso, &bpopS, &bpopT);
     [self nvmtlE78Barrier:YES];
-    if (![self nvmtlPrepareIndirectImages]) return;
+    if (![self nvmtlPrepareIndirectImages]) { if (nbg) nvmtl_bounce_out(_cb, bg, bgs, bso, nbg, bpopS, bpopT); return; }
     nvmtl_cbt_kernel(_cb, selected->_function ? selected->_function->_fname.UTF8String : NULL);
     nvmtl_vk_dispatch_label(selected->_function ? selected->_function->_fname.UTF8String : NULL);
     nvmtl_vk_dispatch_key(nvmtl_function_spv_fnv(selected->_function), nvmtl_function_air_key(selected->_function));
     nvmtl_vk_cmd_dispatch_indirect_tg(&_cb->_c, &selected->_p, &nb->_b, off, l);
+    if (nbg) nvmtl_bounce_out(_cb, bg, bgs, bso, nbg, bpopS, bpopT);
+    nvmtl_bounce_vet(self, selected);
     if (_cb->_stTwins.count) nvmtl_storage_twins_out(_cb);
 }
 // Before an indirect dispatch, every texture the encoder declared with useResource:usage: is brought in for this command
@@ -7385,6 +7523,7 @@ static void nvmtl_tg_reshape(NVMTLComputePipelineState *ps, const uint32_t l[3],
     } else if (_e78Loose || _g79Bar) { if (nvmtl_hz_mode() != 1) { nvmtl_hz_shadow(1); nvmtl_vk_barrier_site(NVMTL_BARS_ENCODER_END); nvmtl_vk_cmd_barrier(&_cb->_c); nvmtl_hz_shadow(0); } _e78Loose = NO; _g79Bar = NO; nvmtl_enc78_count(E78C_ENDFULL, 1); }
     nvmtl_g79_census();
     nvmtl_hz_encoder_end(&_cb->_c);
+    nvmtl_bounce_forget(self); _cb->_nvBounceTop = 0;   // the next encoder makes its own bounce copies
     [_cb->_stTwins removeAllObjects];   // the next encoder copies each twin in again
     _cb->_nEnd++; nvmtl_enc78_census();
     // The command buffer holds every resource until the GPU is done; the encoder's own binding tables are dead after

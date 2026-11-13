@@ -4543,7 +4543,10 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
             else if (sl && sl->kind == NVMTL_SLOT_BUF && (sl->off % NVMTL_SSBO_ALIGN) == 0) {
                 bi[i] = (VkDescriptorBufferInfo){ (VkBuffer)sl->h, sl->off, VK_WHOLE_SIZE }; pb = &bi[i];
             } else {
-                if (sl && sl->kind == NVMTL_SLOT_BUF) { static int said; if (!said++) nvlog("vk: buffer slot %u is bound at offset %zu, not a multiple of %d — reachable only through the address table", i, sl->off, NVMTL_SSBO_ALIGN); }
+                // a shader that reads this slot through its descriptor (address lowering kept it) reads the dummy; compute
+                // dispatches bounce such slots first (nvmtl_vk_bounce_plan), so a line here names a render stage or NVMTL_SSBO_BOUNCE=0
+                if (sl && sl->kind == NVMTL_SLOT_BUF) { static int said; if (said < 8) { said++; nvlog("vk: buffer slot %u of set %u is bound at offset %zu, not a multiple of %d - "
+                    "reachable only through the address table; a descriptor read of it reads the dummy (said up to 8 times)", i, which, sl->off, NVMTL_SSBO_ALIGN); } }
                 pb = &dummyB;
             }
         } else if (ty == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
@@ -4725,6 +4728,146 @@ int nvmtl_vk_bind_buffer(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_buffer
               if (sl->size != b->size || sl->address != a) t->dirty[set] = 1;
               sl->size = b->size; sl->address = a; }
     return r;
+}
+/* Bounce: compute slots a descriptor cannot describe.
+ * Metal binds a compute buffer at any offset its element type allows; a Vulkan storage-buffer descriptor needs a multiple
+ * of minStorageBufferOffsetAlignment (16 on NVK, whose compiler also assumes that base alignment when it merges loads).
+ * Address lowering reads most buffers through the address table, where any offset works, so the descriptor snapshot
+ * writes the dummy for an unaligned slot. But lowering KEEPS a buffer on its descriptor when a runtime array in it is
+ * indexed by a value it counts as data (the WoW froxel grid, #304), and that test counts the dispatch-base push constant
+ * every kernel adds to its thread position: nearly every thread-indexed kernel keeps its arrays as descriptors. Such a
+ * slot at an unaligned offset read zeros from the 256-byte dummy, and its writes went to the dummy - and, compute
+ * running without bounds checks, past it into whatever memory followed.
+ * ANGLE's provoking-vertex kernel (fixIndexBuffer, every indexed draw of a program with a flat varying in WebGL 2) reads
+ * the app's index buffer at the draw's byte offset and writes its own index buffer: the draw then used no indices or
+ * stale ones from an earlier frame. Google Maps in Firefox drew triangles across the map and garbled label glyphs when
+ * zoomed out, and some runs lost the device (an MMU fault, or Xid 13 Misaligned Address). Measured with convpaths
+ * (slow/agents/gmaps): flat-shaded draws with u16 indices at offset 2 mod 4 or u8 indices at odd offsets drew nothing
+ * in every frame, on the original 2.9 driver and on integ-f alike; everything else it draws passed.
+ * Now such a slot runs on a copy: the buffer's bytes from the slot's offset to its end are copied on the GPU into a
+ * 16-aligned scratch buffer, the slot is bound there for the dispatch, and the bytes are copied back after it unless the
+ * module declares every bounced slot NonWritable. Both copies are ordered by full barriers inside the command buffer, so
+ * a kernel reads what earlier GPU work wrote and later work reads what it wrote. Slots of one buffer whose offsets agree
+ * modulo 16 share one copy, so they still alias. NVMTL_SSBO_BOUNCE=0 restores the dummy.
+ * Read-only copies are KEPT for the rest of the compute encoder (NVMTLObjects.m, nvmtl_bounce_in): a copy reaches every
+ * byte to the buffer's end, so one copy serves every later slot of that buffer at a higher offset with the same residue
+ * modulo 16, until a dispatch may have written the buffer - one that binds it in a writable descriptor slot, or whose
+ * module may write anything else (sb_wild). WAS: a fresh tail copy for every dispatch. ANGLE converts each flat-shaded
+ * draw with its own dispatch, all in one encoder, all reading the same index buffer: flatperf (slow/agents/gmaps; 300
+ * draws a frame from an 8 MiB u16 index buffer at offsets 2 mod 16) copied ~1.2 GB a frame and took 73-90 ms a frame,
+ * against ~3 ms at offsets that are multiples of 16; with kept copies 17-19 ms. What is left is the written slot (ANGLE's
+ * output indices): two small copies and their full barriers per draw, ~50 us. NVMTL_SSBO_BOUNCE_KEEP=0 copies for every
+ * dispatch again.
+ * A written slot still copies back every byte from its offset to the buffer's end: a write the CPU or another queue makes
+ * to that tail while the dispatch runs is undone. Without the bounce the kernel's own writes were all lost. */
+int nvmtl_vk_bounce_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SSBO_BOUNCE"); on = !(e && e[0] == '0');
+        nvlog("vk: compute storage buffers bound at an offset a descriptor cannot hold %s (NVMTL_SSBO_BOUNCE=%s)",
+              on ? "run on a 16-aligned GPU copy" : "read the DUMMY (old behaviour)", e ? e : "unset"); }
+    return on;
+}
+int nvmtl_vk_bounce_keep_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SSBO_BOUNCE_KEEP"); on = !(e && e[0] == '0');
+        nvlog("vk: a read-only bounce copy %s (NVMTL_SSBO_BOUNCE_KEEP=%s)",
+              on ? "serves the encoder's later dispatches until the buffer may change" : "is made again for every dispatch (OLD)", e ? e : "unset"); }
+    return on;
+}
+static _Atomic unsigned long long g_bounce_n, g_bounce_in_bytes, g_bounce_out_bytes, g_bounce_split, g_bounce_hits;
+void nvmtl_vk_bounce_hit(void)
+{
+    const unsigned long long n = atomic_fetch_add(&g_bounce_hits, 1) + 1;
+    if (!(n & (n - 1))) nvlog("bounce: %llu dispatches read a kept copy instead of making one (%llu copies made, %.1f MB in)",
+                              n, atomic_load(&g_bounce_n), atomic_load(&g_bounce_in_bytes) / 1048576.0);
+}
+uint32_t nvmtl_vk_bounce_plan(nvk_cmdbuf *c, const nvk_pipeline *p, nvmtl_bounce *out, uint32_t max)
+{
+    if (!c || !p || !p->sb_desc || !c->table || !nvmtl_vk_bounce_on()) return 0;
+    const nvmtl_bindtable *t = (const nvmtl_bindtable *)c->table;
+    uint32_t ng = 0;
+    for (uint32_t m = p->sb_desc; m; m &= m - 1) {
+        const uint32_t i = (uint32_t)__builtin_ctz(m);
+        const nvmtl_slot *sl = nvmtl_slot_checked(&t->s[0][i], 0, i);
+        if (!sl || sl->kind != NVMTL_SLOT_BUF || !sl->h || !(sl->off % NVMTL_SSBO_ALIGN) || sl->off >= sl->size) continue;
+        uint32_t g = 0;
+        for (; g < ng; g++) if (out[g].h == sl->h && out[g].base % NVMTL_SSBO_ALIGN == sl->off % NVMTL_SSBO_ALIGN) break;
+        if (g == ng) {
+            if (ng == max) break;
+            memset(&out[ng], 0, sizeof out[ng]);
+            out[ng].h = sl->h; out[ng].size = sl->size; out[ng].base = sl->off; ng++;
+        }
+        nvmtl_bounce *b = &out[g];
+        if (sl->off < b->base) b->base = sl->off;
+        b->slots |= 1u << i; b->off[i] = sl->off; b->address[i] = sl->address;
+        if (p->sb_ro & (1u << i)) b->ro |= 1u << i;
+    }
+    for (uint32_t g = 0; g < ng; g++) {
+        out[g].len = out[g].size - out[g].base;
+        for (uint32_t k = 0; k < g; k++) if (out[k].h == out[g].h && ((out[k].slots & ~out[k].ro) || (out[g].slots & ~out[g].ro))) {
+            // one buffer at two residues: two copies, and a write through one is not seen through the other
+            const unsigned long long n = atomic_fetch_add(&g_bounce_split, 1) + 1;
+            if (!(n & (n - 1))) nvlog("bounce: a kernel binds one buffer at unaligned offsets that differ modulo 16 and writes it - two copies, "
+                                      "they do not alias (%llu so far)", n);
+            break;
+        }
+    }
+    return ng;
+}
+int nvmtl_vk_bounce_bind(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff)
+{
+    if (!scratch || !scratch->buf) return -1;
+    for (uint32_t m = g->slots; m; m &= m - 1) {
+        const uint32_t i = (uint32_t)__builtin_ctz(m);
+        if (g->off[i] < g->base) return -1;
+        const size_t at = soff + (g->off[i] - g->base);
+        if (at % NVMTL_SSBO_ALIGN || at >= scratch->size || nvmtl_vk_bind_buffer(c, 0, i, scratch, at)) return -1;
+    }
+    return 0;
+}
+int nvmtl_vk_bounce_in(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff)
+{
+    if (!g->len || soff % NVMTL_SSBO_ALIGN || !scratch || soff > scratch->size || g->len > scratch->size - soff) return -1;
+    nvk_buffer src = { 0 }; src.buf = g->h; src.size = g->size;
+    if (nvmtl_vk_cmd_copy_buffer(c, &src, g->base, scratch, soff, g->len)) return -1;
+    if (nvmtl_vk_bounce_bind(c, g, scratch, soff)) return -1;
+    const unsigned long long n = atomic_fetch_add(&g_bounce_n, 1) + 1;
+    const unsigned long long in = atomic_fetch_add(&g_bounce_in_bytes, g->len) + g->len;
+    if ((g->slots & ~g->ro)) atomic_fetch_add(&g_bounce_out_bytes, g->len);
+    if (!(n & (n - 1))) nvlog("bounce: %llu unaligned compute buffer copies made, %.1f MB in, %.1f MB back, %llu dispatches used a kept copy (this one: slots %#x at +%zu, %zu bytes, %s)",
+                              n, in / 1048576.0, atomic_load(&g_bounce_out_bytes) / 1048576.0, atomic_load(&g_bounce_hits), g->slots, g->base, g->len,
+                              (g->slots & ~g->ro) ? "written back" : "read-only");
+    return 0;
+}
+int nvmtl_vk_bounce_out(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff)
+{
+    int r = 0;
+    if (g->slots & ~g->ro) {
+        nvk_buffer dst = { 0 }; dst.buf = g->h; dst.size = g->size;
+        r = scratch ? nvmtl_vk_cmd_copy_buffer(c, scratch, soff, &dst, g->base, g->len) : -1;
+    }
+    // the slots name the app's buffer again, at the offsets it bound, for whatever the encoder does next
+    nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
+    for (uint32_t m = g->slots; t && m; m &= m - 1) {
+        const uint32_t i = (uint32_t)__builtin_ctz(m);
+        if (nvmtl_bind_slot(c, 0, i, NVMTL_SLOT_BUF, g->h, g->off[i])) { r = -1; continue; }
+        nvmtl_slot *sl = &t->s[0][i];
+        if (sl->size != g->size || sl->address != g->address[i]) t->dirty[0] = 1;
+        sl->size = g->size; sl->address = g->address[i];
+    }
+    return r;
+}
+int nvmtl_vk_slots_hold(nvk_cmdbuf *c, uint32_t mask, const void *h)
+{
+    const nvmtl_bindtable *t = c ? (const nvmtl_bindtable *)c->table : NULL;
+    if (!t || !h) return 0;
+    for (uint32_t m = mask; m; m &= m - 1) {
+        const nvmtl_slot *sl = &t->s[0][__builtin_ctz(m)];
+        if (sl->kind == NVMTL_SLOT_BUF && sl->h == h) return 1;
+    }
+    return 0;
 }
 int nvmtl_vk_trace_buffers(nvk_cmdbuf *c, char *out, size_t cap)
 {
@@ -6408,6 +6551,74 @@ static int nvmtl_vk_compute_pipeline_create_g(const void *cs, size_t n, uint32_t
     else *(nvk_pipeline *)out = pending;
     return result;
 }
+// The set-0 storage-buffer descriptors (bindings 0-31) a module declares, those it decorates NonWritable (nvk_pipeline
+// sb_desc / sb_ro, for the bounce), and whether it may write any other memory (sb_wild): a store, atomic, memory copy or
+// extended instruction through a pointer that is not Function, Private or Workgroup memory or one of those descriptors
+// (traced through access chains to its variable), or an image write. Anything the scan cannot place counts as wild, and
+// so does a module that does not parse (which declares no descriptors).
+static void nvmtl_spirv_sb_desc(const void *p, size_t n, uint32_t *mask, uint32_t *ro, uint32_t *wild)
+{
+    *mask = *ro = 0; *wild = 1;
+    const uint32_t *w = (const uint32_t *)p; const size_t nw = n / 4;
+    if (!p || nw < 5 || w[0] != 0x07230203u || !w[3] || w[3] >= (1u << 24)) return;
+    const uint32_t bound = w[3];
+    uint32_t *bind = (uint32_t *)calloc(bound, 4), *set = (uint32_t *)calloc(bound, 4), *cls = (uint32_t *)calloc(bound, 4);
+    uint32_t *rt = (uint32_t *)calloc(bound, 4), *root = (uint32_t *)calloc(bound, 4); uint8_t *fl = (uint8_t *)calloc(bound, 1);
+    if (!bind || !set || !cls || !rt || !root || !fl) { free(bind); free(set); free(cls); free(rt); free(root); free(fl); return; }
+    int ok = 1;
+    for (size_t i = 5; i < nw; ) {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!wc || i + wc > nw) { ok = 0; break; }
+        const uint32_t a1 = wc > 1 ? w[i + 1] : 0, a2 = wc > 2 ? w[i + 2] : 0, a3 = wc > 3 ? w[i + 3] : 0;
+        if (op == 71 && wc >= 3 && a1 < bound) {   // OpDecorate: Binding, DescriptorSet, NonWritable
+            if (a2 == 33 && wc == 4) bind[a1] = a3 + 1;
+            else if (a2 == 34 && wc == 4) set[a1] = a3 + 1;
+            else if (a2 == 24) fl[a1] |= 1;
+        } else if ((op == 32 || op == 39) && wc >= 3 && a1 < bound) cls[a1] = a2 + 1;   // OpTypePointer, OpTypeForwardPointer
+        else if (op == 59 && wc >= 4 && a2 < bound) { rt[a2] = a1; root[a2] = a2; if (a3 == 12) fl[a2] |= 2; }   // OpVariable
+        else if (op == 11 && wc >= 3 && a1 < bound) {   // OpExtInstImport: GLSL.std.450 (4), NonSemantic.* (8), any other (16)
+            const char *nm = (const char *)&w[i + 2]; const size_t cap = (size_t)(wc - 2) * 4;
+            fl[a1] |= strnlen(nm, cap) == 12 && !memcmp(nm, "GLSL.std.450", 12) ? 4 : !strncmp(nm, "NonSemantic.", cap < 12 ? cap : 12) ? 8 : 16;
+        }
+        else if ((op == 65 || op == 66 || op == 67 || op == 70 || op == 83) && wc >= 4 && a2 < bound) {   // access chains, OpCopyObject
+            rt[a2] = a1; root[a2] = a3 < bound ? root[a3] : 0;
+        } else if ((op == 1 || op == 55 || op == 57 || op == 60 || op == 61 || op == 120 || op == 121 || op == 122 || op == 123
+                    || op == 124 || op == 169 || op == 245 || op == 400) && wc >= 3 && a2 < bound) rt[a2] = a1;   // other pointer sources
+        i += wc;
+    }
+    // a pointer's storage class (+1, 0 unknown); writes through Function, Private and Workgroup pointers stay in the kernel
+    #define SBD_CLS(id) ((id) < bound && rt[id] < bound ? cls[rt[id]] : 0)
+    #define SBD_SLOT(r) ((r) && (fl[r] & 2) && set[r] == 1 && bind[r] >= 1 && bind[r] <= 32)
+    int wr = !ok;
+    for (size_t i = 5; ok && !wr && i < nw; ) {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        uint32_t ptr = 0; int has = 0;
+        if ((op == 62 || op == 63 || op == 64 || op == 228 || op == 319 || op == 4458 || op == 5360) && wc >= 2) { ptr = w[i + 1]; has = 1; }
+        else if (((op >= 229 && op <= 242) || op == 318 || op == 5614 || op == 5615 || op == 6035) && wc >= 4) { ptr = w[i + 3]; has = 1; }
+        else if (op == 99 || op == 60) wr = 1;   // OpImageWrite; OpImageTexelPointer (image atomics)
+        else if (op == 12 && wc >= 5) {   // OpExtInst: GLSL.std.450 Modf (35) / Frexp (51) write through their last operand
+            const uint32_t set_ = w[i + 3] < bound ? fl[w[i + 3]] : 0;
+            if (set_ & 4) { if ((w[i + 4] == 35 || w[i + 4] == 51) && wc >= 7) { ptr = w[i + 6]; has = 1; } }
+            else if (!(set_ & 8)) wr = 1;   // an instruction set this scan does not know
+        }
+        if (has) {
+            const uint32_t c = SBD_CLS(ptr);
+            if (c == 4 + 1 || c == 6 + 1 || c == 7 + 1) {}
+            else if (c == 12 + 1 && ptr < bound && SBD_SLOT(root[ptr])) {}
+            else wr = 1;
+        }
+        i += wc;
+    }
+    #undef SBD_CLS
+    #undef SBD_SLOT
+    for (uint32_t id = 0; ok && id < bound; id++)
+        if ((fl[id] & 2) && set[id] == 1 && bind[id] >= 1 && bind[id] <= 32) {
+            *mask |= 1u << (bind[id] - 1);
+            if (fl[id] & 1) *ro |= 1u << (bind[id] - 1);
+        }
+    *wild = (uint32_t)wr;
+    free(bind); free(set); free(cls); free(rt); free(root); free(fl);
+}
 static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size_t n, uint32_t flags, nvk_pipeline *out)
 {
     if (nvmtl_heap_binding_refused(cs, n, "compute")) return -1;
@@ -6425,6 +6636,7 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     if (!g_heapSet && nvmtl_spirv_uses_set(cs, n / 4, 2)) {
         nvlog("vk: compute pipeline REFUSED - the kernel indexes the bindless heap (set 2) and this device has none"); return -1; }
     memset(out, 0, sizeof *out);
+    nvmtl_spirv_sb_desc(cs, n, &out->sb_desc, &out->sb_ro, &out->sb_wild);
     if (!(flags & 1) && ag[0]) {
         if (!(out->ag_src = malloc(ag_srcn))) { nvlog("align guard: out of memory keeping a module's source - pipeline REFUSED"); return -1; }
         memcpy(out->ag_src, ag_src, ag_srcn); out->ag_srcn = ag_srcn; out->ag_mask = ag[0]; out->ag_req = ag[1] >= 8 ? ag[1] : 8;
