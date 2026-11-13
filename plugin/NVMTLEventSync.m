@@ -65,9 +65,19 @@ static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t)
 #ifndef nvtrace
 static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #endif
-static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
+// How many pending-write records exist (all queues), for the IOSurfaceLock wait's lock-free early out. Written under the
+// command-buffer class lock after every change to nvmtl_surface_writers.
+static _Atomic unsigned long nvmtl_surface_writes_live;
+static void nvmtl_surface_writes_recount(void) {
+    unsigned long n = 0;
+    for (id queue in nvmtl_surface_writers.keyEnumerator) n += [(NSDictionary *)[nvmtl_surface_writers objectForKey:queue] count];
+    atomic_store_explicit(&nvmtl_surface_writes_live, n, memory_order_release);
+}
+// Returns YES when cb writes an IOSurface.
+static BOOL nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
     // The same lock as pending_write and finish_writes, taken here too: the map is shared with the completion thread, and
     // its one caller holding this (recursive) lock today must not be what keeps WindowServer's heap intact.
+    BOOL any = NO;
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_surface_writers) nvmtl_surface_writers = [NSMapTable weakToStrongObjectsMapTable];
         NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
@@ -77,8 +87,11 @@ static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
             NVMTLPendingSurfaceWrite *write = [NVMTLPendingSurfaceWrite new];
             write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
             writes[nvmtl_surface_writer_key(t)] = write;
+            any = YES;
         }
+        if (any) nvmtl_surface_writes_recount();
     }
+    return any;
 }
 // WindowServer frame completion, with NVAccel's nvSurfGpuEscape: each surface a WindowServer command buffer renders is
 // marked pending when it commits and ready when the GPU has finished it, and the swap waits for that in the kernel, off
@@ -269,7 +282,94 @@ static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
             if (!write->buffer || write->buffer == cb) [writes removeObjectForKey:key];
         }
         if (!writes.count) [nvmtl_surface_writers removeObjectForKey:cb->_queue];
+        nvmtl_surface_writes_recount();
     }
+}
+// IOSurfaceLock waits for this process's GPU writes. On Apple's drivers a normal IOSurfaceLock (anything but
+// kIOSurfaceLockAvoidSync) waits until the GPU has finished every write to the surface already committed, so an app may
+// commit a render into a surface and lock it for the CPU at once. Browsers do exactly that: ANGLE's glFlush commits the
+// WebGL / accelerated-canvas frame into its IOSurface, and Firefox's software WebRender (hardware compositing off) maps
+// that surface under IOSurfaceLock(ReadOnly) right after, on another thread of the same process. Here the kernel only
+// waits for WindowServer's own pending marks (nvSurfGpuEscape takes no other process's), and an app's surface is marked
+// newest in VRAM only when its part has landed (nvmtlSurfaceOut), so until then the lock found the old system copy
+// current and the CPU read the previous frame, or zeros (fully transparent: the white page behind it) from a surface
+// made at a new size - canvases and WebGL views flashing white or stale while things were resized.
+// Measured (slow/agents/glitch/bin/anglesurf 300 6 flush 0: Firefox 160's ANGLE draws 6 tiles into pooled IOSurfaces,
+// one changing size every frame, glFlush, then IOSurfaceLock(ReadOnly) and 256 points per tile): 75-98% of the reads
+// (about 30% of the points) were wrong, the same on the 2.9 base, integ6 and opt-surfaces, with or without 6 ms between
+// frames; every read of a newly sized surface was all zeros. glFinish instead of glFlush: none. With this wait: 0 of
+// 1200 reads in each of 6 runs (NVMTL_SURFLOCK_WAIT=0 brings the failures back). Metal alone (pool gpucheck: commit,
+// no wait, lock and read): 440-3253 of 614400 points wrong -> 0.
+// Now, outside WindowServer, IOSurfaceLock is rebound in every image outside the shared cache (Firefox's XUL, Chromium
+// and Electron frameworks, ANGLE) as each one loads, from the first commit that writes an IOSurface on. A lock without
+// kIOSurfaceLockAvoidSync first waits, at most NVMTL_SURFLOCK_WAIT_MS, for the command buffers of this process that
+// still have a committed write to that surface in flight (nvmtl_surface_writers: registered at commit, removed once the
+// write is published), then takes the real lock, whose page-off then copies the finished VRAM. A lock with no such write
+// in flight costs one atomic load. Not covered: system frameworks in the shared cache (their calls to IOSurfaceLock are
+// bound inside the cache) and a reader in another process. NVMTL_SURFLOCK_WAIT=0 turns it off.
+#define NVMTL_SURFLOCK_WAIT_MS 500
+static unsigned long long nvmtl_surflock_waited, nvmtl_surflock_late;
+static void nvmtl_surface_lock_wait(IOSurfaceRef surf) {
+    if (!surf || !atomic_load_explicit(&nvmtl_surface_writes_live, memory_order_acquire)) return;
+    const uint32_t sid = IOSurfaceGetID(surf);
+    size_t planes = IOSurfaceGetPlaneCount(surf); if (!planes) planes = 1; if (planes > 256) planes = 256;
+    NSMutableArray<NVMTLCommandBuffer *> *writers = nil;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        for (id queue in nvmtl_surface_writers.keyEnumerator) {
+            NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
+            for (size_t p = 0; p < planes; p++) {
+                NVMTLPendingSurfaceWrite *write = writes[@(((unsigned long long)sid << 8) | p)];
+                NVMTLCommandBuffer *cb = write ? write->buffer : nil; NVMTLTexture *t = write ? write->texture : nil;
+                // the writer's texture holds its surface, so a live record with this ID is this surface
+                if (!cb || !t || !t->_surf || IOSurfaceGetID(t->_surf) != sid) continue;
+                if (!writers) writers = [NSMutableArray new];
+                if ([writers indexOfObjectIdenticalTo:cb] == NSNotFound) [writers addObject:cb];
+            }
+        }
+    }
+    if (!writers) return;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:NVMTL_SURFLOCK_WAIT_MS / 1000.0];
+    BOOL late = NO;
+    for (NVMTLCommandBuffer *cb in writers) {
+        [cb->_completionCondition lock];
+        while (!cb->_executionDone && !cb->_completionReady && !late) late = ![cb->_completionCondition waitUntilDate:deadline];
+        [cb->_completionCondition unlock];
+    }
+    const unsigned long long n = __atomic_add_fetch(late ? &nvmtl_surflock_late : &nvmtl_surflock_waited, 1, __ATOMIC_RELAXED);
+    if (late || n < 4 || !(n & (n - 1)))
+        nvlog("IOSurfaceLock of surface %u %s its GPU write (%llu waited, %llu gave up after %d ms)", sid,
+              late ? "gave up waiting for" : "waited for", nvmtl_surflock_waited, nvmtl_surflock_late, NVMTL_SURFLOCK_WAIT_MS);
+}
+static IOReturn nvmtl_iosurface_lock(IOSurfaceRef surf, IOSurfaceLockOptions options, uint32_t *seed) {
+    if (!(options & kIOSurfaceLockAvoidSync)) nvmtl_surface_lock_wait(surf);
+    return IOSurfaceLock(surf, options, seed);   // this image's own import is never rebound
+}
+static int nvmtl_surflock_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_SURFLOCK_WAIT"), *me = getprogname();
+        const int ws = me && !strcmp(me, "WindowServer");
+        on = !(e && e[0] == '0') && !ws;
+        nvlog("IOSurfaceLock %s (NVMTL_SURFLOCK_WAIT=%s)", on ? "waits for this process's committed GPU writes to the surface"
+              : ws ? "left alone in WindowServer (the kernel waits for its pending marks)" : "OFF: a lock can read a surface the GPU is still writing", e ?: "unset");
+    }
+    return on;
+}
+static void nvmtl_surflock_image_added(const struct mach_header *mh, intptr_t slide) {
+    (void)slide;
+    if (!mh || mh->magic != MH_MAGIC_64 || (mh->flags & MH_DYLIB_IN_CACHE)) return;
+    static const void *self; static dispatch_once_t once;
+    dispatch_once(&once, ^{ Dl_info di; self = dladdr((const void *)nvmtl_surflock_image_added, &di) ? di.dli_fbase : NULL; });
+    if ((const void *)mh == self) return;
+    Dl_info di; const char *path = dladdr(mh, &di) ? di.dli_fname : NULL;
+    if (path && (strstr(path, "/GPUBundles/") || strstr(path, "NVMTLDriver.bundle/"))) return;   // the driver's own libraries
+    const int n = nvmtl_rebind_import(mh, "_IOSurfaceLock", (void *)nvmtl_iosurface_lock);
+    if (n > 0) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 16) nvlog("IOSurfaceLock rebound in %s (%d slot(s))", path ?: "?", n); }
+}
+static void nvmtl_surflock_install(void) {
+    static dispatch_once_t once;
+    if (!nvmtl_surflock_on()) return;
+    dispatch_once(&once, ^{ _dyld_register_func_for_add_image(nvmtl_surflock_image_added); });   // runs now for every loaded image too
 }
 
 @implementation NVMTLSubmissionPart
@@ -869,13 +969,16 @@ static void nvmtl_gsub_ahead_pass1(void) {
     // (_commitMarking stops the submit-ahead pass) or completes it (it is not pending yet) before its marks are in.
     nvmtl_ws_mark_pending(self);
     _scheduleAfterPublish = nvmtl_surface_schedule_after_publish(self);
+    BOOL writesSurface;
     @synchronized ([NVMTLCommandBuffer class]) {
         _commitMarking = NO;
-        nvmtl_surface_register_writes(self);
+        writesSurface = nvmtl_surface_register_writes(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
         nvmtl_pump_buffers();
     }
+    // outside the class lock: the image walk takes dyld's lock
+    if (writesSurface) nvmtl_surflock_install();
 }
 @end
 
