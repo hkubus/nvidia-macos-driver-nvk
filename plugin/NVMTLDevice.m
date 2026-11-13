@@ -1711,11 +1711,28 @@ static uint64_t nvmtl_vram_warm_ns(void) {
     }
     return (uint64_t)ns;
 }
+// Kept surface pages of a window that changes now and then (a cursor blink, a clock, a status line: anything slower
+// than the 250 ms idle limit) idled out between its changes, so each change pinned and mapped its pages again on the
+// binding thread: 1.6-2.5 ms per change of a 2560x1400 window updated every 500 ms. They now stay kept under the warm
+// rule of family imports (a wrapper used the surface in the last NVMTL_VRAM_WARM seconds and someone besides the keep
+// still holds it); they need no refresh (they hold no age). They stay within the page cap (NVMTL_HOST_PAGES_MB): a new
+// surface whose pages would pass it first releases kept pages unused for 2 s or more, the longest unused first
+// (nvmtl_host_keep_shed), so still windows do not keep live ones on one-off imports. NVMTL_HOST_PAGES_WARM=0 turns it off.
+static size_t nvmtl_host_keep_shed(const void *base, size_t want);
+static int nvmtl_host_warm_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_HOST_PAGES_WARM"); on = !(e && e[0] == '0') && nvmtl_host_reuse_on();
+        if (on) nvmtl_host_pages_shed_hook = nvmtl_host_keep_shed;
+        nvlog("surface pages: %s (NVMTL_HOST_PAGES_WARM=%s)", on ? "kept while their window is warm, the longest unused released at the page cap" : "idle out after 250 ms", e ?: "unset");
+    }
+    return on;
+}
 // Under g_vram_kept_lock: someone besides the keep's own entries and a running refresh holds the surface.
 static int nvmtl_vram_held_elsewhere_locked(IOSurfaceRef surf);
 static int nvmtl_vram_keep_warm_locked(const nvmtl_vram_kept *e, uint64_t now) {
     const uint64_t warm = nvmtl_vram_warm_ns();
-    return !e->host && warm && now - e->parked < warm && nvmtl_vram_held_elsewhere_locked(e->surf);
+    return (!e->host || nvmtl_host_warm_on()) && warm && now - e->parked < warm && nvmtl_vram_held_elsewhere_locked(e->surf);
 }
 // Under g_vram_kept_lock: entry k is the youngest kept import of its surface, plane and size.
 static int nvmtl_vram_keep_youngest_locked(unsigned k) {
@@ -1741,7 +1758,7 @@ static void nvmtl_vram_keep_sweep(void) {
         const int warm = !aged && idle && nvmtl_vram_keep_warm_locked(e, now);
         if (aged || (idle && !warm)) { gone[ng++] = nvmtl_vram_keep_take_at(k); continue; }
         // a warm import nearing the age limit is made again off this thread (it stays here until the new one is in)
-        if (warm && nre < NVMTL_VRAM_WARM_SWEEP_MAX && now - e->born >= NVMTL_VRAM_KEEP_REFRESH_NS && nvmtl_vram_refresh_on()
+        if (warm && !e->host && nre < NVMTL_VRAM_WARM_SWEEP_MAX && now - e->born >= NVMTL_VRAM_KEEP_REFRESH_NS && nvmtl_vram_refresh_on()
             && nvmtl_vram_keep_youngest_locked(k) && nvmtl_vram_refresh_claim_locked(e->surf, e->plane)) {
             CFRetain(e->surf);   // the claim holds no reference; the entry may go before the job starts
             re[nre].surf = e->surf; re[nre].plane = e->plane; re[nre].need = e->need; re[nre].parked = e->parked; nre++;
@@ -1827,6 +1844,68 @@ static void nvmtl_vram_refresh_start(IOSurfaceRef surf, NSUInteger plane, size_t
             nvlog("IOSurface VRAM import refreshed ahead of its age limit (%llu made, %llu of them for still windows, %llu refused)", n, w, f);
         CFRelease(surf);
     });
+}
+// Kept surface pages released, the longest unused first, until `want` bytes are (nvmtl_host_pages_shed_hook), or none if
+// the pages unused for the shed guard (2 s at first) add up to less; then the surface past the cap takes one-off pages, as
+// before. Shedding any longest-unused pages turned windows that change in turn past the cap (cpumany: 24 2560x1400
+// windows, 344 MB of pages) into an import plus a release on every change, no kept page ever used again: 2.48 ms a frame
+// instead of 0.18 ms with changes 6 ms apart. The guard adapts the same way for slower turns: when pages come back
+// within NVMTL_VRAM_WARM of being shed (they are remembered by address), the guard doubles, up to that window, so a
+// cycle of windows past the cap settles with most of them kept and the rest on one-off pages (24 windows each changed
+// every ~2.5 s: 0.27 ms a frame with no shedding, 2.26 ms shedding at a fixed 2 s guard, 1.79 ms before warm pages).
+// It halves back toward 2 s after 30 s without a comeback, so still windows' pages keep giving way to new live ones.
+#define NVMTL_HOST_SHED_IDLE_NS (2000ull * 1000 * 1000)
+#define NVMTL_HOST_SHED_GHOSTS  32
+static struct { const void *base; uint64_t at, guard; } g_host_ghost[NVMTL_HOST_SHED_GHOSTS];   // under g_vram_kept_lock
+static unsigned g_host_ghost_next;
+static unsigned long long g_host_shed_n;   // pages released for the cap, for the log
+static uint64_t g_host_shed_guard = NVMTL_HOST_SHED_IDLE_NS, g_host_shed_guard_at;
+static size_t nvmtl_host_keep_shed(const void *base, size_t want) {
+    unsigned ng = 0, ne = 0; size_t freed = 0, can = 0;
+    const uint64_t now = nvmtl_vram_keep_now(), warm = nvmtl_vram_warm_ns();
+    uint64_t was = 0, guard;
+    pthread_mutex_lock(&g_vram_kept_lock);
+    if (g_host_shed_guard > NVMTL_HOST_SHED_IDLE_NS && now - g_host_shed_guard_at >= 30ull * 1000 * 1000 * 1000) {
+        was = g_host_shed_guard; g_host_shed_guard = MAX(NVMTL_HOST_SHED_IDLE_NS, g_host_shed_guard / 2); g_host_shed_guard_at = now;
+    }
+    for (unsigned k = 0; base && k < NVMTL_HOST_SHED_GHOSTS; k++)
+        if (g_host_ghost[k].base == base && now - g_host_ghost[k].at < warm) {   // pages shed earlier came back: shed less
+            g_host_ghost[k].base = NULL;
+            // once per guard: the pages shed together under it come back together
+            if (g_host_ghost[k].guard == g_host_shed_guard && g_host_shed_guard < warm) { was = g_host_shed_guard; g_host_shed_guard = MIN(warm, g_host_shed_guard * 2); }
+            g_host_shed_guard_at = now;
+            break;
+        }
+    guard = g_host_shed_guard;
+    for (unsigned k = 0; k < g_vram_kept_n; k++)
+        if (g_vram_kept[k].host && now - g_vram_kept[k].parked >= guard) { can += g_vram_kept[k].vb.size; ne++; }
+    // nothing goes unless enough does: the surface would take one-off pages anyway
+    nvmtl_vram_kept *gone = want && can >= want ? malloc(ne * sizeof *gone) : NULL;
+    while (gone && freed < want) {
+        int o = -1;
+        for (unsigned k = 0; k < g_vram_kept_n; k++)
+            if (g_vram_kept[k].host && now - g_vram_kept[k].parked >= guard && (o < 0 || g_vram_kept[k].parked < g_vram_kept[o].parked)) o = (int)k;
+        if (o < 0) break;
+        gone[ng] = nvmtl_vram_keep_take_at((unsigned)o); freed += gone[ng].vb.size;
+        g_host_ghost[g_host_ghost_next].base = gone[ng].vb.map; g_host_ghost[g_host_ghost_next].at = now; g_host_ghost[g_host_ghost_next].guard = guard;
+        g_host_ghost_next = (g_host_ghost_next + 1) % NVMTL_HOST_SHED_GHOSTS;
+        ng++;
+    }
+    const unsigned long long shed_n = g_host_shed_n += ng;
+    pthread_mutex_unlock(&g_vram_kept_lock);
+    if (was) { static unsigned said; if (said++ < 8) nvlog("surface pages: the page cap now releases kept pages unused for %llu ms (was %llu ms)",
+                                                          (unsigned long long)(guard / 1000000), (unsigned long long)(was / 1000000)); }
+    if (!ng) { free(gone); return 0; }
+    // Counted out of the cap now and released off this thread: releasing 2560x1400 pages on the binding thread cost
+    // ~0.5 ms per change (cpumany 24 120, CPUMANY_GAP_MS=25). Pinned pages pass the cap by `freed` until the job runs.
+    for (unsigned k = 0; k < ng; k++) nvmtl_vk_host_pages_uncount(&gone[k].vb);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        for (unsigned k = 0; k < ng; k++) { nvmtl_vk_buffer_destroy(&gone[k].vb); if (gone[k].surf) CFRelease(gone[k].surf); }
+        free(gone);
+    });
+    if (shed_n - ng < 4 || __builtin_clzll(shed_n) < __builtin_clzll(shed_n - ng))   // the first few, then at each power of two
+        nvlog("surface pages: the page cap released %u kept import(s), %zu KiB, for a new surface (%llu so far)", ng, freed >> 10, shed_n);
+    return freed;
 }
 // A kept import of this surface and size, or an import made now. born is the import's time, for nvmtl_vram_keep_put.
 // host: kept surface pages of any size (nvmtl_host_pages checks them), never imported here.
