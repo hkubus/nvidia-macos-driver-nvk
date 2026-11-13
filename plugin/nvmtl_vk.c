@@ -220,6 +220,46 @@ static void nvmtl_event_wait_choose(void)
     setenv("NVRM_EVENT_WAIT", "1", 0);
     nvlog("vk: %s (%s): fence waits sleep on the GPU's completion event (NVMTL_ANGLE_EVENT_WAIT=0 polls)", getprogname(), why);
 }
+// Firefox ends every WebGL frame with glFinish on an NVIDIA GPU. At present (SharedSurface_IOSurface::ProducerReleaseImpl,
+// gfx/gl/SharedSurfaceIO.cpp) it asks ANGLE for an EGL_SYNC_METAL_SHARED_EVENT_ANGLE sync to hand the frame to its
+// compositor with a fence, and when that fails it logs "Creating EGL_SYNC_METAL_SHARED_EVENT sync failed" and calls
+// glFinish: the WebGL thread waits for the GPU to finish the frame before it takes the next one. Here it fails on every
+// frame (1951 failures in 1952 frames of slow/agents/webglperf/web/bench.html, the same on the 2.9 base): ANGLE's Metal
+// backend turns its hasEvents feature off for any NVIDIA device (DisplayMtl: hasEvents = !isNVIDIA(), from the vendor ID
+// in the IORegistry), so the display has no EGL_KHR_fence_sync and eglCreateSync refuses the type, while Firefox checks
+// only EGL_ANGLE_metal_shared_event_sync, which ANGLE exposes everywhere. ANGLE reads ANGLE_FEATURE_OVERRIDES_ENABLED
+// once, when it builds the display's features, which is after it has made its MTLDevice and so after this init; a
+// Gecko process (XUL loaded) gets hasEvents added there. hasEvents only exposes the EGL/GL fence extensions; ANGLE's
+// GLES3 fence syncs already use MTLEvent on this driver, and NVMTLSharedEvent has what the shared-event syncs use
+// (encodeSignalEvent, signaledValue, notifyListener, waitUntilSignaledValue). Firefox's software compositor then maps
+// the surface under IOSurfaceLock, which waits for this process's committed GPU writes (NVMTL_SURFLOCK_WAIT), so it
+// still reads the finished frame: with NVMTL_SURFLOCK_WAIT=0 this stays off (slow/agents/webglperf/bin/synctest, lock
+// right after the fenced flush: 0 of 1030 frames stale here, 1014 of 1030 on the 2.9 base without that wait).
+// Measured: synctest (Firefox's ANGLE; 1000 draws and a ~3 ms full-screen pass per frame, the compositor reading the
+// previous frame) 5.39 -> 3.69 ms per frame, medians of 3 interleaved runs; the private Firefox copy on web/bench.html
+// (mix, fs=5000, rAF) 112 -> 134 fps median of 3 on a shared GPU. A value that already names hasEvents (enabled or
+// disabled) wins. NVMTL_ANGLE_FENCES=0 leaves ANGLE's features alone.
+static int nvmtl_gecko_process(void)
+{
+    for (uint32_t i = 0, c = _dyld_image_count(); i < c; i++) {
+        const char *path = _dyld_get_image_name(i), *base = path ? strrchr(path, '/') : NULL;
+        if (base && !strcmp(base, "/XUL")) return 1;
+    }
+    return 0;
+}
+static void nvmtl_angle_fences_choose(void)
+{
+    const char *me = getprogname(), *knob = getenv("NVMTL_ANGLE_FENCES"), *lockwait = getenv("NVMTL_SURFLOCK_WAIT");
+    if (!me || !strcmp(me, "WindowServer") || !nvmtl_gecko_process()) return;
+    if (knob && knob[0] == '0') { nvlog("vk: %s: ANGLE's hasEvents left as ANGLE chooses (NVMTL_ANGLE_FENCES=0)", me); return; }
+    if (lockwait && lockwait[0] == '0') { nvlog("vk: %s: ANGLE's hasEvents left off: IOSurfaceLock does not wait (NVMTL_SURFLOCK_WAIT=0)", me); return; }
+    const char *on = getenv("ANGLE_FEATURE_OVERRIDES_ENABLED"), *off = getenv("ANGLE_FEATURE_OVERRIDES_DISABLED");
+    if ((on && strstr(on, "hasEvents")) || (off && strstr(off, "hasEvents"))) { nvlog("vk: %s: ANGLE's hasEvents is set in the environment - left alone", me); return; }
+    char v[1024];
+    if (on && *on) snprintf(v, sizeof v, "%s:hasEvents", on); else snprintf(v, sizeof v, "hasEvents");
+    setenv("ANGLE_FEATURE_OVERRIDES_ENABLED", v, 1);
+    nvlog("vk: %s (Gecko): ANGLE_FEATURE_OVERRIDES_ENABLED=%s - WebGL frames are handed over with a Metal shared-event fence, not glFinish (NVMTL_ANGLE_FENCES=0 leaves it)", me, v);
+}
 static size_t g_alloc_bytes;
 static uint64_t g_buf_made, g_buf_gone, g_img_made, g_img_gone;
 static uint64_t g_pool_blocks, g_pool_live, g_pool_bytes;
@@ -1130,7 +1170,7 @@ static int nvmtl_vk_initialize(void)
        though RADV compiles them. GCN 1/2 have no 16-bit ALU and keep shaderFloat16 off: their half modules stay refused,
        which is what keeps ACO from compiling half arithmetic it cannot lower there. A value the user set wins. */
     if (nvmtl_vk_vendor() == 0x1002) setenv("radv_enable_float16_gfx8", "true", 0);
-    if (nvmtl_vk_vendor() == 0x10de) nvmtl_event_wait_choose();
+    if (nvmtl_vk_vendor() == 0x10de) { nvmtl_event_wait_choose(); nvmtl_angle_fences_choose(); }
     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
     if (g_lib) {
         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
