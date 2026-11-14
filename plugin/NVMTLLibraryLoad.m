@@ -2998,8 +2998,11 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
                   @"!\"air.visible_function_table\"",
                   @"!\"air.intersection_function_table\""];
     });
+    // Every form contains "_function_table", so one byte-wise search clears the common case. The searches are literal:
+    // the forms are ASCII, and the default (Unicode-aware) comparison cost tens of milliseconds per call on large modules.
+    if ([air rangeOfString:@"_function_table" options:NSLiteralSearch].location == NSNotFound) return NO;
     for (NSString *f in forms)
-        if ([air rangeOfString:f].location != NSNotFound) return YES;
+        if ([air rangeOfString:f options:NSLiteralSearch].location != NSNotFound) return YES;
     return NO;
 }
 
