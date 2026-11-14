@@ -10374,6 +10374,7 @@ int nvmtl_vk_surfin_async_on(void)
 int nvmtl_vk_image_write_host_async(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache,
                                     void (*done)(void *), void *ctx)
 {
+    if (nvmtl_copy_into_multisample("image_write_host_async", img)) return -1;
     const size_t bpp = img->bpp ? img->bpp : 4;
     size_t at;
     if (img->bw > 1 || img->bh > 1 || nvmtl_host_page_span(&base, &bytes, bpp, row_bytes, img->w, img->h, &at)) return -1;
