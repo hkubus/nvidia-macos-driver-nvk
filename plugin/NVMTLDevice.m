@@ -924,6 +924,38 @@ static uint64_t nvmtl_rt_gate_working_set(uint64_t ws)
     if (!said++) nvlog("working set: answered %lld MB instead of %llu MB while ray tracing is available (NVMTL_WS_RT_GATE_MB)", floor_mb, (unsigned long long)(ws >> 20));
     return (uint64_t)floor_mb << 20;
 }
+// Image parks (nvmtl_ipark_*): see "Private surface images" in the NVMTLDevice implementation below.
+extern uint64_t (*nvmtl_ipark_drain_hook)(void);   // nvmtl_vk.c: called when VRAM refuses an image
+#define NVMTL_SPARK_N       16
+#define NVMTL_SPARK_IDLE_NS (500ull * 1000 * 1000)
+#define NVMTL_SPARK_BYTES   (256ull << 20)
+#define NVMTL_TPARK_N       256   // entries of the texture park (NVMTL_TPARK_WIDE=0: NVMTL_TPARK_N_NARROW)
+#define NVMTL_TPARK_IDLE_NS (4000ull * 1000 * 1000)
+#define NVMTL_TPARK_N_NARROW       64
+#define NVMTL_TPARK_IDLE_NS_NARROW (2000ull * 1000 * 1000)
+#define NVMTL_IPARK_GONE_N  64    // shapes recently evicted or idled out, to tell those misses from new shapes in the census
+#define NVMTL_TPARK_LEND_OLDEST 8   // a full texture park lends only from its 8 oldest (the next to be evicted)
+typedef struct { nvk_image img; uint32_t key[8]; uint64_t seq, parked; } nvmtl_spark_t;
+typedef struct {
+    const char *what, *knob; unsigned cap_n; uint64_t idle_ns, cap_bytes; int on;
+    int submitted_only;   // reuse waits for the submits made before the release, not also for command buffers still being encoded
+    nvmtl_spark_t e[NVMTL_TPARK_N]; unsigned n, sweep; uint64_t bytes;
+    unsigned long long hit, miss, parked, evicted, idled, drained, lent;
+    unsigned long long miss_busy, miss_gone;   // misses: a parked one of that shape still had GPU work queued; the shape was evicted or idled out
+    uint32_t gone_h[NVMTL_IPARK_GONE_N]; unsigned gone_i;
+    uint64_t sweep_ns;   // how often the idle sweep runs while anything is parked (0: idle_ns)
+    pthread_mutex_t lock;
+} nvmtl_ipark;
+static nvmtl_ipark g_spark = { "private surface image", "NVMTL_SURF_IMAGE_PARK", NVMTL_SPARK_N, NVMTL_SPARK_IDLE_NS, NVMTL_SPARK_BYTES, -1,
+                               .submitted_only = 0,
+                               .lock = PTHREAD_MUTEX_INITIALIZER };
+static nvmtl_ipark g_tpark = { "texture", "NVMTL_TEXTURE_PARK", NVMTL_TPARK_N, NVMTL_TPARK_IDLE_NS, 0, -1, .submitted_only = 1,
+                               .lock = PTHREAD_MUTEX_INITIALIZER };
+static uint64_t nvmtl_ipark_drain_all(void);
+static int nvmtl_ipark_take(nvmtl_ipark *p, const uint32_t key[8], nvk_image *out);
+static int nvmtl_tpark_donor(uint64_t need, uint32_t mtype1, nvk_image *out);
+static void nvmtl_tpark_reap(nvk_image *shell);
+
 @implementation NVMTLDevice
 @dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, removable, sparseTileSizeInBytes, supportsPlacementSparse;
 + (void)load {
@@ -1501,6 +1533,29 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
     nvlog("newTextureWithDescriptor: %lux%lu 4:2:2 format %lu as full-width RGBA8 -> %p", (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.pixelFormat, (__bridge void *)t);
     return t;
 }
+static void nvmtl_tpark_zero_owe(NVMTLTexture *t, int lent);   // NVMTLObjects.m
+// ANGLE's textures go to the texture park too. ANGLE (the WebGL of every browser and Electron app) makes every texture
+// Managed with ShaderRead, ShaderWrite and RenderTarget usage, two of them for a glTexImage2D with data, so a page that
+// makes and drops textures - map tiles and glyph pages while Google Maps loads and zooms - paid NVK's four RM calls to
+// make each and two to free it on its WebGL thread (slow/agents/webglperf/bin/wglbench texnew: 32 new 64x64 textures a
+// frame, ~0.3 ms of process CPU per GL texture, nearly all in RM calls; parked: 13.9 -> 3.4 ms a frame, process CPU
+// 10.5 -> 1.3 ms, medians of 3 interleaved runs, pixels identical). A Managed texture is a GPU image here like a
+// Private one (replaceRegion and getBytes copy through staging), so a parked image of the same key is exactly the image
+// the create would make. Its old contents are what Metal and GL promise for a new texture (undefined), and WebGL's robust
+// resource initialization has ANGLE clear or upload every texture before its first use. Only in a process with ANGLE
+// loaded (nvmtl_browser_gpu_process), decided at its first Managed render-target texture. NVMTL_TPARK_MANAGED=0: not parked.
+static const char *nvmtl_browser_gpu_process(void);
+static int nvmtl_tpark_managed_on(void)
+{
+    static int on = -1;
+    if (__atomic_load_n(&on, __ATOMIC_ACQUIRE) >= 0) return on;
+    const char *e = getenv("NVMTL_TPARK_MANAGED"), *why = nvmtl_browser_gpu_process();
+    const int v = !(e && e[0] == '0') && why != NULL;
+    nvlog("texture park: Managed render-target textures %s (%s, NVMTL_TPARK_MANAGED=%s)", v ? "are parked like Private ones" : "are freed",
+          why ? why : "no ANGLE in this process", e ?: "unset");
+    __atomic_store_n(&on, v, __ATOMIC_RELEASE);
+    return v;
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     if (nvmtl_vk_init()) return nil;
     if (d.textureType == MTLTextureTypeTextureBuffer) {
@@ -1537,8 +1592,27 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
         if (wantStex) { static _Atomic unsigned long msw; const unsigned long k = atomic_fetch_add(&msw, 1) + 1;
             if (!(k & (k - 1))) nvlog("newTextureWithDescriptor: %lu multisample texture(s) asked for ShaderWrite - created like Apple (M1/D300 create them); no storage view", k); }
         if (nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED (multisample)"); return nil; }
-    } else
-    if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+    } else {
+        const uint32_t layers = nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth);
+        // a Private texture a GPU pass writes is parked when released (nvmtl_ipark_put): the key is every argument of
+        // the create below, so a parked image is exactly the image it would make
+        const BOOL park = (d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))
+            && (d.storageMode == MTLStorageModePrivate || (d.storageMode == MTLStorageModeManaged && nvmtl_tpark_managed_on()));
+        const uint32_t key[8] = { (uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)a8 | (uint32_t)wantStex << 8 | (uint32_t)d.textureType << 16,
+                                  (uint32_t)d.mipmapLevelCount, layers, 0x54504b31u /* 'TPK1' */ };
+        // a shape the park does not hold may be made on the memory of a parked one of another shape (nvmtl_tpark_donor);
+        // the lender's image and view come back in shell and are destroyed off this thread
+        nvk_image shell = {0};
+        const int recycled = park && !nvmtl_ipark_take(&g_tpark, key, &t->_i);
+        if (!recycled
+            && nvmtl_vk_image_create_typed_from((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, layers,
+                                                park ? nvmtl_tpark_donor : NULL, &shell, &t->_i)) { nvmtl_tpark_reap(&shell); nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+        const int lent = shell.img != NULL;   // made on the memory of a parked texture (nvmtl_tpark_donor)
+        nvmtl_tpark_reap(&shell);
+        // a recycled or lent target holds its last owner's pixels: cleared to zero before its first use, as a new one reads
+        if (recycled || lent) nvmtl_tpark_zero_owe(t, lent);
+        if (park) { memcpy(t->_sparkKey, key, sizeof key); t->_sparkable = YES; t->_sparkPlain = YES; }
+    }
     nvmtl_alloc_ok();
     t->_q = nvmtl_device_queue();
     t->_stex = t->_i.storage == 1;
@@ -1604,21 +1678,71 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 // is never handed out past NVMTL_VRAM_KEEP_AGE_NS from its import, so a backing the family replaced is picked up again
 // as before. A private image's imported surface pages (nvmtl_vk_image_write_host / _read_host) are kept the same way:
 // pinning and mapping them costs more than copying a 1080p frame. NVMTL_VRAM_KEEP=0 turns both off.
-#define NVMTL_VRAM_KEEP_N       64
+// Size: once the surfaces WindowServer composites outgrow the budget, the oldest-parked eviction throws out each import
+// just before its next wrapper asks for it, and every wrapper imports again. Measured on 3440x1440 (19.8 MB a surface):
+// 6 surfaces wrapped per frame cost 0.04 ms, 7 cost 3.9 ms, 9 cost 12 ms, 12 cost 28 ms. WAS a fixed 128 MiB and 64
+// entries (six full-screen surfaces of an ultrawide); the budget now follows the card (an eighth of VRAM, 128 MiB to
+// 1 GiB, NVMTL_VRAM_KEEP_MB still sets it) and up to 192 imports are kept. A kept import holds a surface its app still
+// has, or for at most NVMTL_VRAM_KEEP_IDLE_NS one it let go, so the larger budget costs no memory while the desktop is
+// steady.
+//
+// Shared imports (NVMTL_VRAM_SHARE): a family import handed to a wrapper now stays listed here with a count of the
+// wrappers using it (users), and the next wrapper of the same surface, plane and size takes the same import while it
+// is younger than the age limit, instead of needing one of its own. WAS: each wrapper took its import out of the keep,
+// so a wrapper made while the previous one of the same surface was still alive (Core Animation re-wraps a window's
+// surface whenever its contents change, and the old wrapper lives until the GPU is done with the frame that drew it)
+// found nothing kept and imported on the compositor thread. Each surface needed one import per wrapper in flight
+// (two or three), and the refresh-ahead replaced only one of them, so the others aged out every two seconds and the
+// next frame imported again (WindowServer slide, anim5 spindump: 431 of 481 wrap samples were these imports). The
+// wrappers alias the same VRAM through their own images either way: only the RM objects are shared. An import is
+// released only once no wrapper uses it; the age rule is unchanged (an import older than NVMTL_VRAM_KEEP_AGE_NS is
+// never handed to a new wrapper, the refresh-ahead makes a young one first), so a backing the family replaced is
+// picked up exactly as soon as before. Imports in use do not count against the idle budget and are never evicted;
+// the sweep also refreshes ahead an import in use that a second wrapper took (the window's contents change while it
+// is shown) within NVMTL_VRAM_WARM, as it does a still window's kept one, so a window whose contents change every
+// second or two finds a young import at each change instead of one just past the age limit. An import only its first
+// wrapper uses (a still window Core Animation keeps wrapped) is not refreshed while in use: that would spend an
+// import every 1.6 s on windows that may never change.
+// NVMTL_VRAM_SHARE=0: one import per wrapper, as before (the in-use imports are still listed, for the census).
+// NVMTL_VRAM_KEEP_STATS=1 logs a census of hits and the reasons for misses every 128 wraps.
+#define NVMTL_VRAM_KEEP_N       320
 #define NVMTL_VRAM_KEEP_IDLE_NS (250ull * 1000 * 1000)
 #define NVMTL_VRAM_KEEP_AGE_NS  (2000ull * 1000 * 1000)
-typedef struct { IOSurfaceRef surf; NSUInteger plane; size_t need; nvk_buffer vb; uint64_t born, parked; int host; } nvmtl_vram_kept;
+// bytes: what the entry adds to g_vram_kept_bytes while no wrapper uses it (a family import's size; 0 for surface pages
+// under nvmtl_host_reuse_on). users: wrappers holding this import (family imports only; surface pages are taken out).
+// rewrapped: a second wrapper took this import (the surface's contents change while it is shown)
+typedef struct { IOSurfaceRef surf; NSUInteger plane; size_t need; nvk_buffer vb; uint64_t born, parked, bytes; int host; unsigned users, rewrapped; } nvmtl_vram_kept;
 static nvmtl_vram_kept g_vram_kept[NVMTL_VRAM_KEEP_N];
 static unsigned g_vram_kept_n, g_vram_kept_sweep;
-static uint64_t g_vram_kept_bytes;
-static unsigned long long g_vram_kept_hit, g_vram_kept_miss;
+static uint64_t g_vram_kept_bytes;   // entries no wrapper uses
+static unsigned long long g_vram_kept_hit, g_vram_kept_miss, g_vram_kept_shared;
 static pthread_mutex_t g_vram_kept_lock = PTHREAD_MUTEX_INITIALIZER;
+static int nvmtl_vram_share_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_VRAM_SHARE"); on = !(e && e[0] == '0');
+        nvlog("IOSurface imports: %s (NVMTL_VRAM_SHARE=%s)", on ? "wrappers of one surface share its import" : "one import per wrapper (old)", e ?: "unset"); }
+    return on;
+}
+// Miss census (NVMTL_VRAM_KEEP_STATS=1): why a wrapper found no import to take. busy: the surface's imports were all
+// in use by other wrappers (no sharing); aged: past the age limit; gone: dropped earlier (idle, evicted, aged), seen in
+// the last 64 drops; new: never kept here (a new surface, or one dropped longer ago). A miss of the first three kinds
+// is a surface wrapped again, so the import made for it counts as rewrapped (refreshed ahead while in use).
+enum { NVMTL_KM_BUSY, NVMTL_KM_AGED, NVMTL_KM_GONE, NVMTL_KM_NEW, NVMTL_KM_N };
+static unsigned long long g_vram_miss_why[NVMTL_KM_N];
+static IOSurfaceRef g_vram_ghost[64]; static unsigned g_vram_ghost_next;   // identity only, never dereferenced
+static void nvmtl_vram_keep_census(void);
+static int nvmtl_vram_stats_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_VRAM_KEEP_STATS"); on = e && e[0] == '1'; if (on) atexit(nvmtl_vram_keep_census); }
+    return on;
+}
 static uint64_t nvmtl_vram_keep_cap(void) {
     static uint64_t cap;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *e = getenv("NVMTL_VRAM_KEEP"), *mb = getenv("NVMTL_VRAM_KEEP_MB");
-        cap = 128ull << 20;
+        const uint64_t card = nvmtl_vk_vram_bytes() / 8;
+        cap = card < (128ull << 20) ? 128ull << 20 : card > (1024ull << 20) ? 1024ull << 20 : card;
         if (mb && *mb) {
             char *end = NULL;
             const unsigned long long n = strtoull(mb, &end, 10);
@@ -1630,27 +1754,125 @@ static uint64_t nvmtl_vram_keep_cap(void) {
     return cap;
 }
 static uint64_t nvmtl_vram_keep_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+// Surface pages reused by every wrapper: a CPU-drawn surface (Firefox's software-rendered tiles, any app drawing with
+// CoreGraphics) changes its seed every frame, and WindowServer wraps it in a new texture every frame. Its pages were
+// imported (pinned and GPU-mapped: two RM calls each way) for every upload: only a private image's first wrapper took
+// kept pages, a family-VRAM wrapper never did, so its pages were imported again for each new wrapper and then parked
+// here unused until they idled out, holding the 256 MiB page cap (past it every copy imported and freed its own) and a
+// share of the VRAM budget and its 192 slots. Measured with a 2560x1400 surface the CPU rewrote every frame: 2.7 ms of
+// the 3.0 ms bind went to that import and its release. Now any wrapper about to copy (nvmtlSurfaceIn, nvmtlSurfaceOut)
+// takes the surface's kept pages first. Kept pages are not held to the import age: they are this process's own mapping
+// of a surface the entry holds (so it is neither freed nor unmapped), the pin keeps exactly those pages, and every copy
+// checks they still start at the surface's address with the same length (nvmtl_host_pages). They count against the page
+// cap (NVMTL_HOST_PAGES_MB) instead of the VRAM budget. NVMTL_HOST_PAGES_REUSE=0 turns it off.
+static int nvmtl_host_reuse_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_HOST_PAGES_REUSE"); on = !(e && e[0] == '0');
+        nvlog("surface pages: %s (NVMTL_HOST_PAGES_REUSE=%s)", on ? "every wrapper reuses the kept import" : "only a private image's first wrapper takes a kept import (old)", e ?: "unset"); }
+    return on;
+}
+// The kept entry outlives its import age (nvmtl_host_reuse_on: surface pages are checked at every copy instead).
+static int nvmtl_vram_keep_ageless(const nvmtl_vram_kept *e) { return e->host && nvmtl_host_reuse_on(); }
 // Removes entry k under the lock and hands it back to be released outside it.
 static nvmtl_vram_kept nvmtl_vram_keep_take_at(unsigned k) {
     nvmtl_vram_kept e = g_vram_kept[k];
-    g_vram_kept_bytes -= e.vb.size;
+    if (!e.users) g_vram_kept_bytes -= e.bytes;
     g_vram_kept[k] = g_vram_kept[--g_vram_kept_n];
+    if (!e.host) { g_vram_ghost[g_vram_ghost_next] = e.surf; g_vram_ghost_next = (g_vram_ghost_next + 1) % 64; }
     return e;
 }
 static void nvmtl_vram_keep_drop(int host, nvk_buffer *vb) { if (host) nvmtl_vk_host_pages_drop(vb); else nvmtl_vk_buffer_destroy(vb); }
 static void nvmtl_vram_keep_release(nvmtl_vram_kept *e) { nvmtl_vram_keep_drop(e->host, &e->vb); if (e->surf) CFRelease(e->surf); }
 static void nvmtl_vram_keep_schedule(void);
+// Warm imports: a window that sits still is not composited, so its kept import idled out 250 ms after its last
+// wrapper and was past the 2 s age long before the next animation. The "show desktop" slide or a drag then imported
+// every window again on its first frame (anim3, WindowServer: 235 of the 244 wrap samples were these imports, up to
+// ~4 ms each for a 3440x1440 window; a test process measures ~0.9 ms). A family import of a surface someone besides
+// this keep still holds (WindowServer still has the window) and that a wrapper used in the last NVMTL_VRAM_WARM
+// seconds is kept past the idle limit, and the sweep re-imports it on the refresh queue before it reaches the age
+// limit, so the next wrapper takes an import younger than the 2 s age as before: the age rule, and with it the bound on
+// how long a replaced family backing can be shown, is unchanged. A surface only the keep holds (the window closed) is
+// never warm: it goes at the idle limit, so a closed window's surface is freed as soon as before. Cost: one import and
+// one release on the refresh queue per warm surface about every 1.6 s (the idle loop: refresh_ns + up to one sweep),
+// for at most NVMTL_VRAM_WARM seconds after its last use, within the keep's budget and its 192 slots (the oldest-used
+// go first). NVMTL_VRAM_WARM=<seconds> (default 30); 0 turns it off.
+#define NVMTL_VRAM_WARM_DEFAULT_S 30
+#define NVMTL_VRAM_WARM_SWEEP_MAX 8   // idle refreshes started per sweep (every 250 ms): spreads a desktop's worth out
+static uint64_t nvmtl_vram_warm_ns(void) {
+    static int64_t ns = -1;
+    if (ns < 0) {
+        const char *e = getenv("NVMTL_VRAM_WARM"); long s = NVMTL_VRAM_WARM_DEFAULT_S;
+        if (e && *e) { char *end = NULL; const long v = strtol(e, &end, 10); if (end != e && !*end && v >= 0 && v <= 3600) s = v; }
+        ns = (int64_t)s * 1000000000ll;
+        nvlog("IOSurface warm imports: %s%ld s after their last use (NVMTL_VRAM_WARM=%s)", s ? "still windows' imports are kept and refreshed for " : "OFF, ", s, e ?: "unset");
+    }
+    return (uint64_t)ns;
+}
+// Kept surface pages of a window that changes now and then (a cursor blink, a clock, a status line: anything slower
+// than the 250 ms idle limit) idled out between its changes, so each change pinned and mapped its pages again on the
+// binding thread: 1.6-2.5 ms per change of a 2560x1400 window updated every 500 ms. They now stay kept under the warm
+// rule of family imports (a wrapper used the surface in the last NVMTL_VRAM_WARM seconds and someone besides the keep
+// still holds it); they need no refresh (they hold no age). They stay within the page cap (NVMTL_HOST_PAGES_MB): a new
+// surface whose pages would pass it first releases kept pages unused for 2 s or more, the longest unused first
+// (nvmtl_host_keep_shed), so still windows do not keep live ones on one-off imports. NVMTL_HOST_PAGES_WARM=0 turns it off.
+static size_t nvmtl_host_keep_shed(const void *base, size_t want);
+static int nvmtl_host_warm_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_HOST_PAGES_WARM"); on = !(e && e[0] == '0') && nvmtl_host_reuse_on();
+        if (on) nvmtl_host_pages_shed_hook = nvmtl_host_keep_shed;
+        nvlog("surface pages: %s (NVMTL_HOST_PAGES_WARM=%s)", on ? "kept while their window is warm, the longest unused released at the page cap" : "idle out after 250 ms", e ?: "unset");
+    }
+    return on;
+}
+// Under g_vram_kept_lock: someone besides the keep's own entries and a running refresh holds the surface.
+static int nvmtl_vram_held_elsewhere_locked(IOSurfaceRef surf);
+static int nvmtl_vram_keep_warm_locked(const nvmtl_vram_kept *e, uint64_t now) {
+    const uint64_t warm = nvmtl_vram_warm_ns();
+    return (!e->host || nvmtl_host_warm_on()) && warm && now - e->parked < warm && nvmtl_vram_held_elsewhere_locked(e->surf);
+}
+// Under g_vram_kept_lock: entry k is the youngest kept import of its surface, plane and size.
+static int nvmtl_vram_keep_youngest_locked(unsigned k) {
+    const nvmtl_vram_kept *e = &g_vram_kept[k];
+    for (unsigned j = 0; j < g_vram_kept_n; j++)
+        if (j != k && !g_vram_kept[j].host && g_vram_kept[j].surf == e->surf && g_vram_kept[j].plane == e->plane
+            && g_vram_kept[j].need == e->need && g_vram_kept[j].born > e->born) return 0;
+    return 1;
+}
+static int nvmtl_vram_refresh_on(void);
+static int nvmtl_vram_refresh_claim_locked(IOSurfaceRef surf, NSUInteger plane);
+static void nvmtl_vram_refresh_start(IOSurfaceRef surf, NSUInteger plane, size_t need, uint64_t parked);
+#define NVMTL_VRAM_KEEP_REFRESH_NS (1500ull * 1000 * 1000)
 static void nvmtl_vram_keep_sweep(void) {
-    nvmtl_vram_kept gone[NVMTL_VRAM_KEEP_N]; unsigned ng = 0;
+    nvmtl_vram_kept *gone = malloc(NVMTL_VRAM_KEEP_N * sizeof *gone); unsigned ng = 0;
+    struct { IOSurfaceRef surf; NSUInteger plane; size_t need; uint64_t parked; } re[NVMTL_VRAM_WARM_SWEEP_MAX]; unsigned nre = 0;
     const uint64_t now = nvmtl_vram_keep_now();
+    int more = 0;   // another sweep has something to do: an entry no wrapper uses, or a warm one in use
     pthread_mutex_lock(&g_vram_kept_lock);
-    for (unsigned k = 0; k < g_vram_kept_n; )
-        if (now - g_vram_kept[k].parked >= NVMTL_VRAM_KEEP_IDLE_NS ||
-            now - g_vram_kept[k].born >= NVMTL_VRAM_KEEP_AGE_NS) gone[ng++] = nvmtl_vram_keep_take_at(k); else k++;
-    const int more = g_vram_kept_n != 0;
+    for (unsigned k = 0; k < g_vram_kept_n; ) {
+        nvmtl_vram_kept *e = &g_vram_kept[k];
+        const int aged = !nvmtl_vram_keep_ageless(e) && now - e->born >= NVMTL_VRAM_KEEP_AGE_NS;
+        const int idle = now - e->parked >= NVMTL_VRAM_KEEP_IDLE_NS;
+        // an import in use is never dropped here (its last wrapper releases it); it is warm while it is rewrapped and its
+        // newest wrapper is younger than NVMTL_VRAM_WARM (parked: when a wrapper last took it)
+        const int warm = !aged && (e->users ? e->rewrapped && nvmtl_vram_warm_ns() && now - e->parked < nvmtl_vram_warm_ns()
+                                            : idle && nvmtl_vram_keep_warm_locked(e, now));
+        if (!e->users && gone && (aged || (idle && !warm))) { gone[ng++] = nvmtl_vram_keep_take_at(k); continue; }
+        // a warm import nearing the age limit is made again off this thread (it stays here until the new one is in)
+        if (warm && !e->host && nre < NVMTL_VRAM_WARM_SWEEP_MAX && now - e->born >= NVMTL_VRAM_KEEP_REFRESH_NS && nvmtl_vram_refresh_on()
+            && (!e->users || nvmtl_vram_share_on())
+            && nvmtl_vram_keep_youngest_locked(k) && nvmtl_vram_refresh_claim_locked(e->surf, e->plane)) {
+            CFRetain(e->surf);   // the claim holds no reference; the entry may go before the job starts
+            re[nre].surf = e->surf; re[nre].plane = e->plane; re[nre].need = e->need; re[nre].parked = e->parked; nre++;
+        }
+        if (!e->users || warm) more = 1;
+        k++;
+    }
     g_vram_kept_sweep = 0;
     pthread_mutex_unlock(&g_vram_kept_lock);
+    for (unsigned k = 0; k < nre; k++) { nvmtl_vram_refresh_start(re[k].surf, re[k].plane, re[k].need, re[k].parked); CFRelease(re[k].surf); }
     for (unsigned k = 0; k < ng; k++) nvmtl_vram_keep_release(&gone[k]);
+    free(gone);
     if (more) nvmtl_vram_keep_schedule();
 }
 static void nvmtl_vram_keep_schedule(void) {
@@ -1660,64 +1882,575 @@ static void nvmtl_vram_keep_schedule(void) {
     if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_VRAM_KEEP_IDLE_NS),
                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_vram_keep_sweep(); });
 }
+// Refresh ahead: the age limit made every surface WindowServer composites import again on the wrapping thread once its
+// import turned two seconds old. A window drag or the "show desktop" slide imports all of them within a few frames, so
+// they also expired within a few frames, every two seconds: 4 ms for each 3440x1440 surface, 12 ms when three met, on a
+// 6 ms frame (the "rare drops while moving windows"). Now a kept import handed out past NVMTL_VRAM_KEEP_REFRESH_NS is
+// imported again on a background queue and parked beside the old one; the next wrapper takes the youngest, and the old
+// import idles out off the frame too. The age limit itself is unchanged. NVMTL_VRAM_REFRESH=0 turns it off.
+#define NVMTL_VRAM_REFRESH_N 32
+static struct { IOSurfaceRef surf; NSUInteger plane; } g_vram_refreshing[NVMTL_VRAM_REFRESH_N];   // identity only; the job retains
+static unsigned g_vram_refreshing_n;
+static unsigned long long g_vram_refreshed, g_vram_refresh_failed, g_vram_warm_refreshed;
+static int nvmtl_vram_held_elsewhere_locked(IOSurfaceRef surf) {
+    CFIndex ours = 0;
+    for (unsigned j = 0; j < g_vram_kept_n; j++) if (g_vram_kept[j].surf == surf) ours++;
+    for (unsigned j = 0; j < g_vram_refreshing_n; j++) if (g_vram_refreshing[j].surf == surf) ours++;   // the job's reference
+    return CFGetRetainCount(surf) > ours;
+}
+static void nvmtl_vram_keep_put_at(int host, IOSurfaceRef surf, NSUInteger plane, nvk_buffer *vb, uint64_t born, uint64_t parked);
+static void nvmtl_vram_keep_put(int host, IOSurfaceRef surf, NSUInteger plane, nvk_buffer *vb, uint64_t born);
+static int nvmtl_vram_refresh_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_VRAM_REFRESH"); on = !(e && e[0] == '0');
+        nvlog("IOSurface import refresh ahead: %s (NVMTL_VRAM_REFRESH=%s)", on ? "imports nearing the age limit are made again off the wrapping thread" : "OFF", e ?: "unset"); }
+    return on;
+}
+static dispatch_queue_t nvmtl_vram_refresh_queue(void) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.vram-refresh", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0)); });
+    return q;
+}
+// Under g_vram_kept_lock: 1 when no refresh of (surf, plane) is running and one may start (the caller starts it unlocked).
+static int nvmtl_vram_refresh_claim_locked(IOSurfaceRef surf, NSUInteger plane) {
+    for (unsigned k = 0; k < g_vram_refreshing_n; k++) if (g_vram_refreshing[k].surf == surf && g_vram_refreshing[k].plane == plane) return 0;
+    if (g_vram_refreshing_n == NVMTL_VRAM_REFRESH_N) return 0;
+    g_vram_refreshing[g_vram_refreshing_n].surf = surf; g_vram_refreshing[g_vram_refreshing_n].plane = plane; g_vram_refreshing_n++;
+    return 1;
+}
+// parked: when a wrapper last used the surface (now for a refresh a wrapper started; the kept import's for a warm one),
+// so a refresh never makes a still window look recently used.
+static void nvmtl_vram_refresh_start(IOSurfaceRef surf, NSUInteger plane, size_t need, uint64_t parked) {
+    CFRetain(surf);
+    dispatch_async(nvmtl_vram_refresh_queue(), ^{
+        nvk_buffer vb; const uint64_t born = nvmtl_vram_keep_now();   // taken before the import: it can only expire sooner
+        const int ok = !nvmtl_vk_surface_vram(IOSurfaceGetID(surf), (uint32_t)plane, need, &vb);
+        if (ok) nvmtl_vram_keep_put_at(0, surf, plane, &vb, born, parked);
+        enum { NOLD = 8 }; nvmtl_vram_kept old[NOLD]; unsigned nold = 0;
+        pthread_mutex_lock(&g_vram_kept_lock);
+        // the imports the new one replaces go now instead of at their age limit: one import per still window, not two
+        // (one a wrapper still uses stays until its last wrapper returns it)
+        if (ok && nvmtl_vram_warm_ns()) {
+            for (unsigned k = 0; k < g_vram_kept_n && nold < NOLD; ) {
+                if (!g_vram_kept[k].host && !g_vram_kept[k].users && g_vram_kept[k].surf == surf && g_vram_kept[k].plane == plane && g_vram_kept[k].need == need
+                    && g_vram_kept[k].born < born) old[nold++] = nvmtl_vram_keep_take_at(k);
+                else k++;
+            }
+        }
+        for (unsigned k = 0; k < g_vram_refreshing_n; k++)
+            if (g_vram_refreshing[k].surf == surf && g_vram_refreshing[k].plane == plane) { g_vram_refreshing[k] = g_vram_refreshing[--g_vram_refreshing_n]; break; }
+        if (ok) g_vram_refreshed++; else g_vram_refresh_failed++;
+        if (ok && born - parked >= NVMTL_VRAM_KEEP_IDLE_NS) g_vram_warm_refreshed++;
+        const unsigned long long n = g_vram_refreshed, f = g_vram_refresh_failed, w = g_vram_warm_refreshed;
+        pthread_mutex_unlock(&g_vram_kept_lock);
+        for (unsigned k = 0; k < nold; k++) nvmtl_vram_keep_release(&old[k]);
+        if (n + f < 4 || !((n + f) & (n + f - 1)))
+            nvlog("IOSurface VRAM import refreshed ahead of its age limit (%llu made, %llu of them for still windows, %llu refused)", n, w, f);
+        CFRelease(surf);
+    });
+}
+// Kept surface pages released, the longest unused first, until `want` bytes are (nvmtl_host_pages_shed_hook), or none if
+// the pages unused for the shed guard (2 s at first) add up to less; then the surface past the cap takes one-off pages, as
+// before. Shedding any longest-unused pages turned windows that change in turn past the cap (cpumany: 24 2560x1400
+// windows, 344 MB of pages) into an import plus a release on every change, no kept page ever used again: 2.48 ms a frame
+// instead of 0.18 ms with changes 6 ms apart. The guard adapts the same way for slower turns: when pages come back
+// within NVMTL_VRAM_WARM of being shed (they are remembered by address), the guard doubles, up to that window, so a
+// cycle of windows past the cap settles with most of them kept and the rest on one-off pages (24 windows each changed
+// every ~2.5 s: 0.27 ms a frame with no shedding, 2.26 ms shedding at a fixed 2 s guard, 1.79 ms before warm pages).
+// It halves back toward 2 s after 30 s without a comeback, so still windows' pages keep giving way to new live ones.
+#define NVMTL_HOST_SHED_IDLE_NS (2000ull * 1000 * 1000)
+#define NVMTL_HOST_SHED_GHOSTS  32
+static struct { const void *base; uint64_t at, guard; } g_host_ghost[NVMTL_HOST_SHED_GHOSTS];   // under g_vram_kept_lock
+static unsigned g_host_ghost_next;
+static unsigned long long g_host_shed_n;   // pages released for the cap, for the log
+static uint64_t g_host_shed_guard = NVMTL_HOST_SHED_IDLE_NS, g_host_shed_guard_at;
+static size_t nvmtl_host_keep_shed(const void *base, size_t want) {
+    unsigned ng = 0, ne = 0; size_t freed = 0, can = 0;
+    const uint64_t now = nvmtl_vram_keep_now(), warm = nvmtl_vram_warm_ns();
+    uint64_t was = 0, guard;
+    pthread_mutex_lock(&g_vram_kept_lock);
+    if (g_host_shed_guard > NVMTL_HOST_SHED_IDLE_NS && now - g_host_shed_guard_at >= 30ull * 1000 * 1000 * 1000) {
+        was = g_host_shed_guard; g_host_shed_guard = MAX(NVMTL_HOST_SHED_IDLE_NS, g_host_shed_guard / 2); g_host_shed_guard_at = now;
+    }
+    for (unsigned k = 0; base && k < NVMTL_HOST_SHED_GHOSTS; k++)
+        if (g_host_ghost[k].base == base && now - g_host_ghost[k].at < warm) {   // pages shed earlier came back: shed less
+            g_host_ghost[k].base = NULL;
+            // once per guard: the pages shed together under it come back together
+            if (g_host_ghost[k].guard == g_host_shed_guard && g_host_shed_guard < warm) { was = g_host_shed_guard; g_host_shed_guard = MIN(warm, g_host_shed_guard * 2); }
+            g_host_shed_guard_at = now;
+            break;
+        }
+    guard = g_host_shed_guard;
+    for (unsigned k = 0; k < g_vram_kept_n; k++)
+        if (g_vram_kept[k].host && now - g_vram_kept[k].parked >= guard) { can += g_vram_kept[k].vb.size; ne++; }
+    // nothing goes unless enough does: the surface would take one-off pages anyway
+    nvmtl_vram_kept *gone = want && can >= want ? malloc(ne * sizeof *gone) : NULL;
+    while (gone && freed < want) {
+        int o = -1;
+        for (unsigned k = 0; k < g_vram_kept_n; k++)
+            if (g_vram_kept[k].host && now - g_vram_kept[k].parked >= guard && (o < 0 || g_vram_kept[k].parked < g_vram_kept[o].parked)) o = (int)k;
+        if (o < 0) break;
+        gone[ng] = nvmtl_vram_keep_take_at((unsigned)o); freed += gone[ng].vb.size;
+        g_host_ghost[g_host_ghost_next].base = gone[ng].vb.map; g_host_ghost[g_host_ghost_next].at = now; g_host_ghost[g_host_ghost_next].guard = guard;
+        g_host_ghost_next = (g_host_ghost_next + 1) % NVMTL_HOST_SHED_GHOSTS;
+        ng++;
+    }
+    const unsigned long long shed_n = g_host_shed_n += ng;
+    pthread_mutex_unlock(&g_vram_kept_lock);
+    if (was) { static unsigned said; if (said++ < 8) nvlog("surface pages: the page cap now releases kept pages unused for %llu ms (was %llu ms)",
+                                                          (unsigned long long)(guard / 1000000), (unsigned long long)(was / 1000000)); }
+    if (!ng) { free(gone); return 0; }
+    // Counted out of the cap now and released off this thread: releasing 2560x1400 pages on the binding thread cost
+    // ~0.5 ms per change (cpumany 24 120, CPUMANY_GAP_MS=25). Pinned pages pass the cap by `freed` until the job runs.
+    for (unsigned k = 0; k < ng; k++) nvmtl_vk_host_pages_uncount(&gone[k].vb);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        for (unsigned k = 0; k < ng; k++) { nvmtl_vk_buffer_destroy(&gone[k].vb); if (gone[k].surf) CFRelease(gone[k].surf); }
+        free(gone);
+    });
+    if (shed_n - ng < 4 || __builtin_clzll(shed_n) < __builtin_clzll(shed_n - ng))   // the first few, then at each power of two
+        nvlog("surface pages: the page cap released %u kept import(s), %zu KiB, for a new surface (%llu so far)", ng, freed >> 10, shed_n);
+    return freed;
+}
+// A kept import of this surface and size, or an import made now. born is the import's time, for nvmtl_vram_keep_put.
+// host: kept surface pages of any size (nvmtl_host_pages checks them), never imported here.
+static void nvmtl_vram_keep_census(void) {
+    unsigned inuse = 0, idle = 0, users = 0;
+    pthread_mutex_lock(&g_vram_kept_lock);
+    for (unsigned k = 0; k < g_vram_kept_n; k++) if (!g_vram_kept[k].host) { if (g_vram_kept[k].users) { inuse++; users += g_vram_kept[k].users; } else idle++; }
+    const unsigned long long hit = g_vram_kept_hit, miss = g_vram_kept_miss, sh = g_vram_kept_shared, b = g_vram_miss_why[NVMTL_KM_BUSY],
+        ag = g_vram_miss_why[NVMTL_KM_AGED], go = g_vram_miss_why[NVMTL_KM_GONE], nw = g_vram_miss_why[NVMTL_KM_NEW], rf = g_vram_refreshed, wr = g_vram_warm_refreshed;
+    const uint64_t bytes = g_vram_kept_bytes;
+    pthread_mutex_unlock(&g_vram_kept_lock);
+    nvlog_every("IOSurface import census: %llu reused (%llu shared with a live wrapper), %llu imported (busy %llu, aged %llu, gone %llu, new %llu); "
+                "listed %u in use by %u wrappers, %u idle (%llu MiB); %llu refreshed ahead (%llu still)", hit, sh, miss, b, ag, go, nw,
+                inuse, users, idle, (unsigned long long)(bytes >> 20), rf, wr);
+}
+// Lists an import made for a wrapper as in use (users 1), so the surface's next wrapper can share it; 0 when there is
+// no room (every slot in use): the wrapper then owns it alone and returns it through the plain path.
+static int nvmtl_vram_keep_list_in_use(IOSurfaceRef surf, NSUInteger plane, size_t need, const nvk_buffer *vb, uint64_t born, int rewrapped) {
+    const uint64_t cap = nvmtl_vram_keep_cap();
+    if (!surf || !cap || !vb->buf || !vb->size || vb->size > cap) return 0;
+    nvmtl_vram_kept gone = { 0 }; int ng = 0, listed = 0;
+    pthread_mutex_lock(&g_vram_kept_lock);
+    if (g_vram_kept_n == NVMTL_VRAM_KEEP_N) {   // full: the idle entry parked longest ago gives its slot
+        int o = -1; for (unsigned k = 0; k < g_vram_kept_n; k++) if (!g_vram_kept[k].users && (o < 0 || g_vram_kept[k].parked < g_vram_kept[o].parked)) o = (int)k;
+        if (o >= 0) { gone = nvmtl_vram_keep_take_at((unsigned)o); ng = 1; }
+    }
+    if (g_vram_kept_n < NVMTL_VRAM_KEEP_N) {
+        CFRetain(surf);
+        g_vram_kept[g_vram_kept_n++] = (nvmtl_vram_kept){ surf, plane, need, *vb, born, nvmtl_vram_keep_now(), vb->size, 0, 1, rewrapped ? 1u : 0u };
+        listed = 1;
+    }
+    pthread_mutex_unlock(&g_vram_kept_lock);
+    if (ng) nvmtl_vram_keep_release(&gone);
+    if (listed) nvmtl_vram_keep_schedule();
+    return listed;
+}
 // A kept import of this surface and size, or an import made now. born is the import's time, for nvmtl_vram_keep_put.
 // host: kept surface pages of any size (nvmtl_host_pages checks them), never imported here.
 static int nvmtl_vram_keep_get(int host, IOSurfaceRef surf, NSUInteger plane, size_t need, nvk_buffer *out, uint64_t *born) {
+    int again = 0;   // a family miss of a surface wrapped before (busy, aged or recently dropped)
     if (nvmtl_vram_keep_cap()) {
         const uint64_t now = nvmtl_vram_keep_now();
-        nvmtl_vram_kept e = { 0 }, old = { 0 }; int found = 0, stale = 0;
+        const int share = !host && nvmtl_vram_share_on(), stats = !host && nvmtl_vram_stats_on();
+        enum { NOLD = 8 };
+        nvmtl_vram_kept e = { 0 }, old[NOLD]; unsigned nold = 0; int found = 0, refresh = 0, best = -1, busy = 0, aged = 0, ghost = 0;
         pthread_mutex_lock(&g_vram_kept_lock);
-        for (unsigned k = 0; k < g_vram_kept_n; k++) {
-            if (g_vram_kept[k].host != host || g_vram_kept[k].surf != surf || g_vram_kept[k].plane != plane || g_vram_kept[k].need != need) continue;
-            if (now - g_vram_kept[k].born < NVMTL_VRAM_KEEP_AGE_NS &&
-                now - g_vram_kept[k].parked < NVMTL_VRAM_KEEP_IDLE_NS) { e = nvmtl_vram_keep_take_at(k); found = 1; }
-            else { old = nvmtl_vram_keep_take_at(k); stale = 1; }
-            break;
+        if (!host) for (unsigned k = 0; k < 64; k++) if (g_vram_ghost[k] == surf) { ghost = 1; break; }
+        // the youngest live import of the surface (a refreshed one sits beside the import it replaces); dead ones go.
+        // One a wrapper uses is live for another wrapper only when imports are shared, and it is never dead here.
+        for (unsigned k = 0; k < g_vram_kept_n; ) {
+            nvmtl_vram_kept *x = &g_vram_kept[k];
+            if (x->host != host || x->surf != surf || x->plane != plane || x->need != need) { k++; continue; }
+            const int young = nvmtl_vram_keep_ageless(x) || now - x->born < NVMTL_VRAM_KEEP_AGE_NS;
+            if (young && (x->users ? share : now - x->parked < NVMTL_VRAM_KEEP_IDLE_NS || nvmtl_vram_keep_warm_locked(x, now))) {
+                if (best < 0 || x->born > g_vram_kept[best].born) best = (int)k;
+                k++;
+            } else if (x->users) { if (young) busy = 1; else aged = 1; k++; }
+            else if (nold < NOLD) {
+                if (!young) aged = 1;
+                const unsigned last = g_vram_kept_n - 1;   // take_at moves the last entry into slot k
+                old[nold++] = nvmtl_vram_keep_take_at(k);
+                if (best == (int)last) best = (int)k;
+            } else k++;
         }
-        if (!host) { if (found) g_vram_kept_hit++; else g_vram_kept_miss++; }
+        if (best >= 0) {
+            found = 1;
+            if (host) e = nvmtl_vram_keep_take_at((unsigned)best);
+            else {   // stays listed, one more wrapper using it
+                nvmtl_vram_kept *x = &g_vram_kept[best];
+                if (!x->users) g_vram_kept_bytes -= x->bytes; else g_vram_kept_shared++;
+                x->users++; x->parked = now; x->rewrapped = 1;
+                e = *x;
+            }
+            if (!host && now - e.born >= NVMTL_VRAM_KEEP_REFRESH_NS && nvmtl_vram_refresh_on()) refresh = nvmtl_vram_refresh_claim_locked(surf, plane);
+        }
+        if (!host) {
+            if (found) g_vram_kept_hit++; else g_vram_kept_miss++;
+            if (!found) { again = busy || aged || ghost; g_vram_miss_why[busy ? NVMTL_KM_BUSY : aged ? NVMTL_KM_AGED : ghost ? NVMTL_KM_GONE : NVMTL_KM_NEW]++; }
+        }
         const unsigned long long hit = g_vram_kept_hit, miss = g_vram_kept_miss;
         pthread_mutex_unlock(&g_vram_kept_lock);
-        if (stale) nvmtl_vram_keep_release(&old);
+        if (refresh) nvmtl_vram_refresh_start(surf, plane, need, now);
+        if (nold && !host && nvmtl_vram_refresh_on()) {   // dead imports are released off the wrapping thread
+            nvmtl_vram_kept *gone = malloc(nold * sizeof *gone);
+            if (gone) { memcpy(gone, old, nold * sizeof *gone); const unsigned ng = nold; nold = 0;
+                dispatch_async(nvmtl_vram_refresh_queue(), ^{ for (unsigned k = 0; k < ng; k++) nvmtl_vram_keep_release(&gone[k]); free(gone); }); }
+        }
+        for (unsigned k = 0; k < nold; k++) nvmtl_vram_keep_release(&old[k]);
         if (!host) { static _Atomic unsigned n; const unsigned count = atomic_fetch_add(&n, 1);
-            if (count < 4 || count % 20000 == 0) nvlog("IOSurface VRAM import %s (%llu reused, %llu imported)", found ? "reused" : "missed", hit, miss); }
-        if (found) { *out = e.vb; *born = e.born; CFRelease(e.surf); return 0; }
+            if (count < 4 || count % 20000 == 0) nvlog("IOSurface VRAM import %s (%llu reused, %llu imported)", found ? "reused" : "missed", hit, miss);
+            if (stats && count % 128 == 127) nvmtl_vram_keep_census(); }
+        if (found) { *out = e.vb; *born = e.born; if (host) CFRelease(e.surf); return 0; }
     }
     memset(out, 0, sizeof *out);
     *born = nvmtl_vram_keep_now();
     if (host) { memset(out, 0, sizeof *out); return -1; }
-    return nvmtl_vk_surface_vram(IOSurfaceGetID(surf), (uint32_t)plane, need, out);
+    const int r = nvmtl_vk_surface_vram(IOSurfaceGetID(surf), (uint32_t)plane, need, out);
+    if (!r && nvmtl_vram_keep_cap()) (void)nvmtl_vram_keep_list_in_use(surf, plane, need, out, *born, again);
+    return r;
 }
 // The texture's import, kept for the surface's next wrapper or released. Clears *vb either way.
 static void nvmtl_vram_keep_put(int host, IOSurfaceRef surf, NSUInteger plane, nvk_buffer *vb, uint64_t born) {
+    nvmtl_vram_keep_put_at(host, surf, plane, vb, born, nvmtl_vram_keep_now());
+}
+// Up to `max` idle entries parked longest ago, while the idle budget is passed (or every slot is taken, full != 0);
+// under the lock. Imports in use are never evicted.
+static unsigned nvmtl_vram_keep_evict_locked(uint64_t cap, uint64_t room, int full, nvmtl_vram_kept *gone, unsigned max) {
+    unsigned ng = 0;
+    while (ng < max && g_vram_kept_n && ((full && g_vram_kept_n == NVMTL_VRAM_KEEP_N) || g_vram_kept_bytes > cap - room)) {
+        int o = -1; for (unsigned k = 0; k < g_vram_kept_n; k++) if (!g_vram_kept[k].users && (o < 0 || g_vram_kept[k].parked < g_vram_kept[o].parked)) o = (int)k;
+        if (o < 0) break;
+        gone[ng++] = nvmtl_vram_keep_take_at((unsigned)o);
+    }
+    return ng;
+}
+// parked: when a wrapper last used this import (a refresh passes the import's it replaces)
+static void nvmtl_vram_keep_put_at(int host, IOSurfaceRef surf, NSUInteger plane, nvk_buffer *vb, uint64_t born, uint64_t parked) {
     if (!vb->buf) { memset(vb, 0, sizeof *vb); return; }
     const uint64_t now = nvmtl_vram_keep_now();
     const uint64_t cap = nvmtl_vram_keep_cap();
-    if (!surf || !cap || !vb->size || vb->size > cap || now - born >= NVMTL_VRAM_KEEP_AGE_NS) {
+    enum { NGONE = 8 };
+    nvmtl_vram_kept gone[NGONE]; unsigned ng = 0;
+    if (!host && cap && surf) {   // a listed import: one wrapper fewer; the last one returns it to the idle keep
+        int listed = 0, last = 0;
+        pthread_mutex_lock(&g_vram_kept_lock);
+        for (unsigned k = 0; k < g_vram_kept_n; k++) {
+            nvmtl_vram_kept *x = &g_vram_kept[k];
+            if (x->host || x->surf != surf || x->vb.buf != vb->buf || !x->users) continue;
+            listed = 1;
+            if (--x->users) break;
+            last = 1; x->parked = parked; g_vram_kept_bytes += x->bytes;
+            if (now - x->born >= NVMTL_VRAM_KEEP_AGE_NS) gone[ng++] = nvmtl_vram_keep_take_at(k);
+            break;
+        }
+        if (last) ng += nvmtl_vram_keep_evict_locked(cap, 0, 0, gone + ng, NGONE - ng);
+        pthread_mutex_unlock(&g_vram_kept_lock);
+        if (listed) {
+            memset(vb, 0, sizeof *vb);
+            for (unsigned k = 0; k < ng; k++) nvmtl_vram_keep_release(&gone[k]);
+            if (last) nvmtl_vram_keep_schedule();
+            return;
+        }
+    }
+    nvmtl_vram_kept e = { surf, plane, host ? 0 : vb->size, *vb, born, parked, vb->size, host, 0, 0 };
+    if (nvmtl_vram_keep_ageless(&e)) e.bytes = 0;   // held to the page cap, which these pages already count against
+    if (!surf || !cap || !vb->size || vb->size > cap || (!nvmtl_vram_keep_ageless(&e) && now - born >= NVMTL_VRAM_KEEP_AGE_NS)) {
         nvmtl_vram_keep_drop(host, vb); memset(vb, 0, sizeof *vb); return;
     }
-    nvmtl_vram_kept e = { surf, plane, host ? 0 : vb->size, *vb, born, now, host }, gone[NVMTL_VRAM_KEEP_N];
-    unsigned ng = 0;
     CFRetain(surf);
-    pthread_mutex_lock(&g_vram_kept_lock);
-    // Both host-page and family imports hold the surface alive. Bound their combined
-    // bytes as well as their count, particularly on small-BAR1 and multi-display systems.
-    while (g_vram_kept_n && (g_vram_kept_n == NVMTL_VRAM_KEEP_N || g_vram_kept_bytes > cap - vb->size)) {
-        unsigned o = 0; for (unsigned k = 1; k < g_vram_kept_n; k++) if (g_vram_kept[k].parked < g_vram_kept[o].parked) o = k;
-        gone[ng++] = nvmtl_vram_keep_take_at(o);
+    int in = 0;
+    while (!in) {
+        pthread_mutex_lock(&g_vram_kept_lock);
+        // Both host-page and family imports hold the surface alive. Bound their combined
+        // bytes as well as their count, particularly on small-BAR1 and multi-display systems.
+        ng = nvmtl_vram_keep_evict_locked(cap, e.bytes, 1, gone, NGONE);
+        const int room = g_vram_kept_n < NVMTL_VRAM_KEEP_N && g_vram_kept_bytes <= cap - e.bytes;
+        if (room) { g_vram_kept[g_vram_kept_n++] = e; g_vram_kept_bytes += e.bytes; in = 1; }
+        else if (ng < NGONE) in = -1;   // every slot holds an import in use: this one is not kept
+        pthread_mutex_unlock(&g_vram_kept_lock);
+        for (unsigned k = 0; k < ng; k++) nvmtl_vram_keep_release(&gone[k]);
     }
-    g_vram_kept[g_vram_kept_n++] = e;
-    g_vram_kept_bytes += vb->size;
-    pthread_mutex_unlock(&g_vram_kept_lock);
+    if (in < 0) { nvmtl_vram_keep_drop(host, vb); CFRelease(surf); }
     memset(vb, 0, sizeof *vb);
-    for (unsigned k = 0; k < ng; k++) nvmtl_vram_keep_release(&gone[k]);
     nvmtl_vram_keep_schedule();
+}
+// Private surface images (multi-plane video and image tiles, surfaces the family VRAM cannot back) were made and freed
+// with every wrapper. CoreVideo's texture cache wraps each pooled pixel buffer anew, so a CMPhoto downscale paid an image,
+// its memory, its bind and their release for every tile, and a video frame the same per plane: well over half of a 6K
+// HEIC downscale once its shader scans were cached. A released one is parked here whole (image, memory, view) and handed
+// to the next private image of the same shape. Its contents need not survive: a wrapper copies its surface in before the
+// first use (nvmtlSurfaceIn), as it does into a new image. A parked image is reused only once every submit that could
+// still read it at its release has completed, is held at most NVMTL_SPARK_IDLE_NS, and all of them at most
+// NVMTL_SPARK_BYTES. NVMTL_SURF_IMAGE_PARK=0 turns it off.
+//
+// Plain textures (newTextureWithDescriptor:) go through a second park of the same kind. CoreAnimation makes and drops a
+// render target for each backdrop capture, blur level and offscreen group, with a new size whenever a window crosses
+// the screen edge: WindowServer's "show desktop" slide made and freed 2-4 a frame. Each costs NVK four RM calls to make
+// (memory, its VA, the image's own VA and its map: ~0.3-0.7 ms) and two to free (~0.2-1.5 ms, the image VA free is the
+// slow one), so the slide spent ~1.4 s of each 14 s on the compositor thread making them and as much again freeing them.
+// Parked, a texture of a shape asked for again costs nothing, and the rest are freed off the frame when they idle out.
+// Only Private textures a GPU pass writes (render target or shader write) are parked: Metal leaves a new texture's
+// contents undefined, and those are the ones every app clears or overwrites before reading; one handed out again is
+// cleared to zero before its first use all the same, as a new allocation reads (NVMTLObjects.m nvmtl_tpark_zero_owe,
+// NVMTL_TPARK_ZERO=0 turns that off). A parked texture is held at
+// most NVMTL_TPARK_IDLE_NS, all of them at most VRAM/16 (64-512 MiB), and an image allocation that VRAM refuses drains
+// both parks before it falls back. NVMTL_TEXTURE_PARK=0 turns it off.
+// Size of the texture park (NVMTL_TPARK_WIDE=0 restores 64 entries, VRAM/32 capped 64-256 MiB, 2 s): WindowServer's slide
+// filled 64 entries and evicted all the time. In a capture of it on the 64-entry park, 154 of the 161 samples on Core
+// Animation's dealloc queue were the eviction loop below freeing parked textures (dealloc+3934 in that build), so a shape
+// asked for again a few frames later had already been freed and was made anew on the compositor thread. A replay of the
+// slide with glass toolbars and blurred sidebars (slow/agents/alloc/src/wsreplay.m) makes ~100 shapes a slide, most of
+// them small; 256 entries took its evictions from 551 to 0 and its RM calls on the creating thread from 3.9 to 1.5 per
+// texture. The idle limit is 4 s, swept every second (a texture lives 4-5 s parked; it was 2-4 s): a user clicking the
+// wallpaper again 2.5 s after the windows slid out found nothing of the first slide left (2% reused), with 4 s 79%.
+// A texture of a shape the park does not hold may be made on the memory of a parked one the park is about to lose
+// (nvmtl_tpark_donor, NVMTL_TPARK_DONOR=0 turns it off).
+// When a plain texture may be reused: a command buffer adds every texture it binds, attaches or blits to its resource set
+// and holds it there until the GPU has finished with it (commandBufferWithUnretainedReferences hands out a retaining one),
+// so a texture that dies is named by no command buffer, encoding or in flight. Reuse waits only for the submits already
+// made when it died (work the driver queued for it outside a command buffer); waiting for the command buffers still being
+// encoded too, as the surface park does, held each texture back two frames and halved the reuse in a slide.
+static int nvmtl_ipark_on(nvmtl_ipark *p)
+{
+    if (__atomic_load_n(&p->on, __ATOMIC_ACQUIRE) >= 0) return p->on;
+    pthread_mutex_lock(&p->lock);
+    if (p->on < 0) {
+        const char *e = getenv(p->knob);
+        int wide = 0;
+        if (p == &g_tpark) {
+            const char *w = getenv("NVMTL_TPARK_WIDE"); wide = !(w && w[0] == '0');
+            if (wide) { p->cap_n = NVMTL_TPARK_N; p->idle_ns = NVMTL_TPARK_IDLE_NS; p->sweep_ns = NVMTL_TPARK_IDLE_NS / 4; }
+            else { p->cap_n = NVMTL_TPARK_N_NARROW; p->idle_ns = NVMTL_TPARK_IDLE_NS_NARROW; p->sweep_ns = 0; }
+        }
+        if (!p->cap_bytes) { const uint64_t c = nvmtl_vk_vram_bytes() / (wide ? 16 : 32), hi = (wide ? 512ull : 256ull) << 20;
+                             p->cap_bytes = c < (64ull << 20) ? 64ull << 20 : c > hi ? hi : c; }
+        nvmtl_ipark_drain_hook = nvmtl_ipark_drain_all;
+        nvlog("%s park: released ones %s, up to %u held for %llu ms, %llu MiB (%s=%s%s)", p->what, !(e && e[0] == '0') ? "are reused" : "are freed",
+              p->cap_n, (unsigned long long)(p->idle_ns / 1000000), (unsigned long long)(p->cap_bytes >> 20), p->knob, e ?: "unset",
+              p == &g_tpark ? (wide ? ", NVMTL_TPARK_WIDE on" : ", NVMTL_TPARK_WIDE=0") : "");
+        __atomic_store_n(&p->on, !(e && e[0] == '0'), __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&p->lock);
+    return p->on;
+}
+static uint32_t nvmtl_ipark_key_hash(const uint32_t key[8])
+{
+    uint32_t h = 2166136261u; for (int i = 0; i < 8; i++) h = (h ^ key[i]) * 16777619u;
+    return h | 1u;   // 0 marks an empty slot of the ring
+}
+// Removes entry k under the lock and hands its image back, to be destroyed outside it.
+static nvk_image nvmtl_ipark_take_at(nvmtl_ipark *p, unsigned k)
+{
+    const nvk_image i = p->e[k].img;
+    p->bytes -= i.alloc;
+    p->e[k] = p->e[--p->n];
+    return i;
+}
+// The same for an entry evicted or idled out: a later miss of its shape is counted as such (census only).
+static nvk_image nvmtl_ipark_drop_at(nvmtl_ipark *p, unsigned k)
+{
+    p->gone_h[p->gone_i++ % NVMTL_IPARK_GONE_N] = nvmtl_ipark_key_hash(p->e[k].key);
+    return nvmtl_ipark_take_at(p, k);
+}
+static void nvmtl_ipark_census(nvmtl_ipark *p, const char *why)
+{
+    const unsigned long long n = p->hit + p->miss;
+    if (n >= 4 && (n & (n - 1))) return;
+    nvlog_every("%s park (%s): %llu reused, %llu made (%llu of a shape still in use by the GPU, %llu of one evicted or idled out), "
+                "%llu on lent memory; %llu parked, %llu evicted, %llu idled out, %llu drained; %u held, %llu MiB",
+                p->what, why, p->hit, p->miss, p->miss_busy, p->miss_gone, p->lent, p->parked, p->evicted, p->idled, p->drained,
+                p->n, (unsigned long long)(p->bytes >> 20));
+}
+#define NVMTL_IPARK_BATCH 16   // images destroyed per lock hold (keeps the arrays below small on dispatch threads)
+static void nvmtl_ipark_schedule(nvmtl_ipark *p);
+static void nvmtl_ipark_sweep(nvmtl_ipark *p)
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    int more = 0;
+    for (unsigned ng = NVMTL_IPARK_BATCH; ng == NVMTL_IPARK_BATCH; ) {
+        nvk_image gone[NVMTL_IPARK_BATCH]; ng = 0;
+        pthread_mutex_lock(&p->lock);
+        for (unsigned k = 0; k < p->n && ng < NVMTL_IPARK_BATCH; ) if (now - p->e[k].parked >= p->idle_ns) gone[ng++] = nvmtl_ipark_drop_at(p, k); else k++;
+        more = p->n != 0;
+        p->idled += ng;
+        if (ng < NVMTL_IPARK_BATCH) p->sweep = 0;
+        pthread_mutex_unlock(&p->lock);
+        for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    }
+    if (more) nvmtl_ipark_schedule(p);
+}
+static void nvmtl_ipark_schedule(nvmtl_ipark *p)
+{
+    pthread_mutex_lock(&p->lock);
+    const int go = !p->sweep && p->n; if (go) p->sweep = 1;
+    pthread_mutex_unlock(&p->lock);
+    if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(p->sweep_ns ? p->sweep_ns : p->idle_ns)),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_ipark_sweep(p); });
+}
+// VRAM refused an image: every parked image is freed (nvmtl_vk_alloc_image_mem retries once). Returns the bytes freed.
+static uint64_t nvmtl_ipark_drain(nvmtl_ipark *p)
+{
+    uint64_t bytes = 0; unsigned all = 0;
+    for (unsigned ng = NVMTL_IPARK_BATCH; ng == NVMTL_IPARK_BATCH; ) {
+        nvk_image gone[NVMTL_IPARK_BATCH]; ng = 0;
+        pthread_mutex_lock(&p->lock);
+        while (p->n && ng < NVMTL_IPARK_BATCH) { gone[ng] = nvmtl_ipark_drop_at(p, p->n - 1); if (!gone[ng].sysmem) bytes += gone[ng].alloc; ng++; }
+        p->drained += ng;
+        pthread_mutex_unlock(&p->lock);
+        for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+        all += ng;
+    }
+    if (all) nvlog("%s park: VRAM refused an image - freed the %u parked (%llu MiB)", p->what, all, (unsigned long long)(bytes >> 20));
+    return bytes;
+}
+static uint64_t nvmtl_ipark_drain_all(void) { return nvmtl_ipark_drain(&g_tpark) + nvmtl_ipark_drain(&g_spark); }
+// A parked image of this shape whose last possible reader has completed: 0 and *out, or -1.
+static int nvmtl_ipark_take(nvmtl_ipark *p, const uint32_t key[8], nvk_image *out)
+{
+    if (!nvmtl_ipark_on(p)) return -1;
+    const uint64_t done = nvmtl_vk_finished_seq();
+    int got = -1, busy = 0;
+    pthread_mutex_lock(&p->lock);
+    for (unsigned k = p->n; k-- > 0; ) {
+        if (memcmp(p->e[k].key, key, sizeof p->e[k].key)) continue;
+        if (p->e[k].seq > done) { busy = 1; continue; }
+        *out = nvmtl_ipark_take_at(p, k); got = 0; break;
+    }
+    if (got) {
+        p->miss++;
+        if (busy) p->miss_busy++;
+        else { const uint32_t h = nvmtl_ipark_key_hash(key); for (unsigned i = 0; i < NVMTL_IPARK_GONE_N; i++) if (p->gone_h[i] == h) { p->miss_gone++; break; } }
+    } else p->hit++;
+    nvmtl_ipark_census(p, got ? "made" : "reused");
+    pthread_mutex_unlock(&p->lock);
+    // hz_ut caches the hazard mode of the texture that owned the image; the new owner's is decided on its first bind
+    if (!got) { out->hz_ut = 0; nvmtl_vk_image_recycled(out); }
+    return got;
+}
+// A texture of a shape the park does not hold: a parked texture of another shape may lend it its memory
+// (nvmtl_vk_image_create_typed_from), which saves NVK's vkAllocateMemory (three RM calls: the memory, its VA and the map;
+// 114 of the 199 samples WindowServer's compositor thread spent making render targets in the slide) and, later, that
+// memory's free. The new image still pays its own VA and map at the bind. Only a texture the park is about to lose lends:
+// the park is full (the next release evicts its oldest) and it is one of the NVMTL_TPARK_LEND_OLDEST oldest. Lending
+// more freely took textures that were asked for again. With 300 recurring shapes (slow/agents/alloc/src/churnbench.m
+// mode 1) lending whenever the park was three-quarters full made creates slower than not lending (175 vs 113 ms); on the
+// slide replay's event logs (slow/agents/alloc/tools/lendsim.awk) letting a texture parked for 2 s lend too took 95
+// textures the windows' return trip 2.5 s later wanted (+9% RM calls on the creating thread), while the full-park rule
+// never took one that would have been reused. A lender must also be complete like any parked texture handed out (its
+// seq), of the same memory type, and hold at least what the new image needs and at most twice that + 256 KiB (a much
+// larger one would hold VRAM the new texture never uses). The smallest such one is taken, the older on a tie.
+// NVMTL_TPARK_DONOR=0 turns it off.
+static int nvmtl_tpark_donor_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_TPARK_DONOR"); on = !(e && e[0] == '0');
+        nvlog("texture park: a new shape %s the memory of a parked texture about to be evicted (NVMTL_TPARK_DONOR=%s)", on ? "may take" : "never takes", e ?: "unset"); }
+    return on;
+}
+static int nvmtl_tpark_donor(uint64_t need, uint32_t mtype1, nvk_image *out)
+{
+    nvmtl_ipark *p = &g_tpark;
+    if (!need || !mtype1 || !nvmtl_tpark_donor_on() || !nvmtl_ipark_on(p)) return -1;
+    const uint64_t done = nvmtl_vk_finished_seq(), most = 2 * need + (256u << 10);
+    int got = -1;
+    pthread_mutex_lock(&p->lock);
+    // full: the next release evicts the oldest, so the NVMTL_TPARK_LEND_OLDEST oldest go first anyway
+    if (p->n + 4 >= p->cap_n || p->bytes + need + (p->cap_bytes >> 4) > p->cap_bytes) {
+        uint64_t o[NVMTL_TPARK_LEND_OLDEST]; unsigned no = 0;   // the oldest park times, ascending
+        for (unsigned k = 0; k < p->n; k++) {
+            const uint64_t t = p->e[k].parked; unsigned i = no < NVMTL_TPARK_LEND_OLDEST ? no++ : NVMTL_TPARK_LEND_OLDEST;
+            if (i == NVMTL_TPARK_LEND_OLDEST) { if (t >= o[i - 1]) continue; i--; }
+            while (i > 0 && o[i - 1] > t) { o[i] = o[i - 1]; i--; }
+            o[i] = t;
+        }
+        const uint64_t old_cut = no ? o[no - 1] : 0;
+        unsigned best = UINT_MAX;
+        for (unsigned k = 0; k < p->n; k++) {
+            const nvmtl_spark_t *e = &p->e[k];
+            if (e->parked > old_cut || e->seq > done || e->img.mtype1 != mtype1 || e->img.alloc < need || e->img.alloc > most) continue;
+            if (best == UINT_MAX || e->img.alloc < p->e[best].img.alloc || (e->img.alloc == p->e[best].img.alloc && e->parked < p->e[best].parked)) best = k;
+        }
+        if (best != UINT_MAX) { *out = nvmtl_ipark_take_at(p, best); p->lent++; got = 0; }
+    }
+    pthread_mutex_unlock(&p->lock);
+    return got;
+}
+// The image and view of a texture whose memory went to a new one: destroyed on a queue of their own, off the creating
+// thread (NVK unmaps and frees the image's VA there: two RM calls). The memory is not theirs any more (mem NULL).
+static void nvmtl_tpark_reap_one(void *ctx) { nvk_image *e = ctx; nvmtl_vk_image_destroy(e); free(e); }
+static void nvmtl_tpark_reap(nvk_image *shell)
+{
+    if (!shell->img) return;
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("nvmtl.texture-reap", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    nvk_image *e = malloc(sizeof *e);
+    if (!e || !q) { free(e); nvmtl_vk_image_destroy(shell); return; }
+    *e = *shell; memset(shell, 0, sizeof *shell);
+    dispatch_async_f(q, e, nvmtl_tpark_reap_one);
+}
+// A released image: parked, or destroyed when it cannot be. Clears *img either way.
+static void nvmtl_ipark_put(nvmtl_ipark *p, const uint32_t key[8], nvk_image *img)
+{
+    if (!img->img) return;
+    // never a sparse, pooled or placed image (their memory is not theirs alone), nor one res1/res2 paged out to system memory
+    if (!nvmtl_ipark_on(p) || !img->alloc || img->alloc > p->cap_bytes || img->sparse || img->pool || img->placed || img->sysmem) {
+        nvmtl_vk_image_destroy(img); return; }
+    nvmtl_vk_image_upload_barrier(img);   // an async upload into it must land before another owner's work can
+    nvmtl_vk_image_parked(img);
+    uint64_t submitted = 0;
+    if (p->submitted_only) nvmtl_vk_cmd_counts(NULL, &submitted, NULL);
+    nvmtl_spark_t e = { .img = *img, .seq = p->submitted_only ? submitted : nvmtl_vk_release_horizon(), .parked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
+    memcpy(e.key, key, sizeof e.key);
+    const size_t a = img->alloc;
+    memset(img, 0, sizeof *img);
+    for (int in = 0; !in; ) {
+        nvk_image gone[NVMTL_IPARK_BATCH]; unsigned ng = 0;
+        pthread_mutex_lock(&p->lock);
+        while (p->n && (p->n >= p->cap_n || p->bytes + a > p->cap_bytes) && ng < NVMTL_IPARK_BATCH) {
+            unsigned o = 0; for (unsigned k = 1; k < p->n; k++) if (p->e[k].parked < p->e[o].parked) o = k;
+            gone[ng++] = nvmtl_ipark_drop_at(p, o);
+        }
+        if (!(p->n && (p->n >= p->cap_n || p->bytes + a > p->cap_bytes))) { p->e[p->n++] = e; p->bytes += a; p->parked++; in = 1; }
+        p->evicted += ng;
+        pthread_mutex_unlock(&p->lock);
+        for (unsigned k = 0; k < ng; k++) nvmtl_vk_image_destroy(&gone[k]);
+    }
+    nvmtl_ipark_schedule(p);
+}
+static int nvmtl_spark_take(const uint32_t key[8], nvk_image *out) { return nvmtl_ipark_take(&g_spark, key, out); }
+static void nvmtl_spark_put(const uint32_t key[8], nvk_image *img) { nvmtl_ipark_put(&g_spark, key, img); }
+// A wrapper of PART of a surface (fewer rows, or fewer bytes per row, than the surface holds) gets a private image, copied
+// in and out, instead of the family's VRAM. On the VRAM its copy-in uploads only its part, yet it published the whole
+// surface as current in VRAM (the surface's VRAM tag, and the in-flight upload a later wrapper joins), so a whole-surface
+// wrapper made or used after it skipped its own upload and showed the old rest of the surface: sharetest (src/sharetest.m)
+// check 4c, a 640x180 wrapper beside a 640x360 one after a CPU write, showed rows 180-359 one write old, the same on the
+// base build and with NVMTL_VRAM_SHARE=0 (it predates shared imports). Its GPU writes likewise marked the whole VRAM
+// current. A private image has no VRAM part: its copy-out goes to the surface's pages under IOSurfaceLock, a new seed, so
+// whole-surface wrappers upload the surface again. The cost is a copy per change for such wrappers only; the slide harness
+// (slidebench) and Core Animation's window surfaces wrap whole surfaces (counted: "partial wrapper" in the log).
+// NVMTL_SURF_PARTIAL_VRAM=1 puts partial wrappers on the family VRAM again (old).
+static int nvmtl_surf_partial_vram_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_PARTIAL_VRAM"); on = e && e[0] == '1';
+        nvlog("IOSurface wrappers of part of a surface: %s (NVMTL_SURF_PARTIAL_VRAM=%s)", on ? "on the family VRAM (old)" : "a private image, copied in and out", e ?: "unset"); }
+    return on;
+}
+static int nvmtl_surf_wrap_whole(IOSurfaceRef surf, uint32_t w, uint32_t h, uint32_t bpp) {
+    const size_t ew = IOSurfaceGetElementWidth(surf) ? IOSurfaceGetElementWidth(surf) : 1;
+    const size_t used = (IOSurfaceGetWidth(surf) + ew - 1) / ew * IOSurfaceGetBytesPerElement(surf);   // bytes of a row the surface holds
+    return h == IOSurfaceGetHeight(surf) && (size_t)w * (bpp ? bpp : 4) >= used;
 }
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
-        if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
+        const int whole = nvmtl_surf_wrap_whole(surf, w, h, bpp);
+        if (!whole) { static _Atomic unsigned np; const unsigned c = atomic_fetch_add(&np, 1);
+            if (c < 8 || c % 1000 == 0) nvlog("item 7: partial wrapper #%u: %ux%u of surface %u %zux%zu (row %zu)%s", c + 1, w, h, (unsigned)IOSurfaceGetID(surf),
+                                              IOSurfaceGetWidth(surf), sh, row, nvmtl_surf_partial_vram_on() ? "" : " - a private image"); }
+        if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0 && (whole || nvmtl_surf_partial_vram_on())) {
             nvk_buffer vb; uint64_t born = 0;
             if (!nvmtl_vram_keep_get(0, surf, 0, row * h, &vb, &born)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
@@ -1732,7 +2465,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                               (unsigned)IOSurfaceGetID(surf), vkf,
                               !(t->_i.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ? "render-target" : "storage");
                         nvmtl_vk_image_destroy(&t->_i);
-                        nvmtl_vk_buffer_destroy(&vb);
+                        nvmtl_vram_keep_put(0, surf, 0, &vb, born);   // listed (maybe shared): returned, never destroyed here
                         goto private_image;
                     }
                     // A shader-writable Managed surface needs one tiled GPU image across
@@ -1743,7 +2476,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                     if (stex && ((t->_ropt >> MTLResourceStorageModeShift) & 0xF) == MTLStorageModeManaged) {
                         nvk_image optimal = { 0 };
                         if (nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &optimal)) {
-                            nvmtl_vk_image_destroy(&t->_i); nvmtl_vk_buffer_destroy(&vb); goto private_image;
+                            nvmtl_vk_image_destroy(&t->_i); nvmtl_vram_keep_put(0, surf, 0, &vb, born); goto private_image;
                         }
                         t->_surfaceLinear = t->_i; t->_i = optimal;
                     }
@@ -1772,9 +2505,12 @@ private_image:
         nvlog("item 7: surface %u %ux%u plane %lu -> a private image, copied in and out (%s; row %zu bytes, %zu plane(s))",
               (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane,
               (plane != 0 || pplanes > 1) ? "more than one plane" : ((size_t)w * (bpp ? bpp : 4) > prow || h > IOSurfaceGetHeight(surf)) ? "image larger than the surface"
-              : (prow % 32) ? "the row is not a multiple of 32 bytes" : "the family VRAM could not be used", prow, pplanes);
+              : (prow % 32) ? "the row is not a multiple of 32 bytes" : !nvmtl_surf_wrap_whole(surf, w, h, bpp) && !nvmtl_surf_partial_vram_on() ? "a part of the surface" : "the family VRAM could not be used", prow, pplanes);
     }
-    const int rc = nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+    // the shape is every argument of the create below, so a parked image is exactly the image it would make
+    const uint32_t key[8] = { w, h, vkf, bpp, (uint32_t)a8, (uint32_t)stex, 2u, 1u };
+    const int rc = surf && !nvmtl_spark_take(key, &t->_i) ? 0 : nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+    if (!rc && surf) { memcpy(t->_sparkKey, key, sizeof key); t->_sparkable = YES; }
     if (!rc && surf) (void)nvmtl_vram_keep_get(1, surf, plane, 0, &t->_hostPages, &t->_vramBorn);
     return rc;
 }
@@ -1802,6 +2538,77 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) 
     return usage;
 }
 
+// A surface backing that wrappers share (a private image, or a Managed surface's tiled GPU image) lived only as long as
+// some wrapper did: the cache holds it weakly. CoreVideo's texture cache and CMPhoto release each wrapper before making
+// the next, so the backing died in between and the next wrapper paid the import, a new image and a full copy-in again:
+// CMPhoto re-wrapped a 6016x6016 HEIC (144 MB) that way for every tile it read. A backing is kept here for
+// NVMTL_LINGER_NS after its last wrap, within NVMTL_LINGER_BYTES, and never past the import age the VRAM keep allows,
+// so a family backing the surface replaced is still picked up again. NVMTL_SURF_LINGER=0 turns it off.
+#define NVMTL_LINGER_N     8
+#define NVMTL_LINGER_NS    (250ull * 1000 * 1000)
+#define NVMTL_LINGER_BYTES (512ull << 20)
+static NSMutableArray *g_linger_tex;   // NVMTLTexture, oldest wrap first
+static NSMutableArray<NSNumber *> *g_linger_at;
+static os_unfair_lock g_linger_lk = OS_UNFAIR_LOCK_INIT;
+static int g_linger_sched;
+static int nvmtl_linger_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_LINGER"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static int nvmtl_linger_expired(NVMTLTexture *t, uint64_t at, uint64_t now)
+{
+    return now - at >= NVMTL_LINGER_NS || (t->_vramOn && now - t->_vramBorn >= NVMTL_VRAM_KEEP_AGE_NS);
+}
+static void nvmtl_linger_schedule(void);
+static void nvmtl_linger_sweep(void)
+{
+    NSMutableArray *gone = [NSMutableArray new];   // released after the lock: a backing's dealloc runs here
+    const uint64_t now = nvmtl_vram_keep_now();
+    os_unfair_lock_lock(&g_linger_lk);
+    for (NSUInteger k = 0; k < g_linger_tex.count; ) {
+        if (nvmtl_linger_expired(g_linger_tex[k], g_linger_at[k].unsignedLongLongValue, now)) {
+            [gone addObject:g_linger_tex[k]]; [g_linger_tex removeObjectAtIndex:k]; [g_linger_at removeObjectAtIndex:k];
+        } else k++;
+    }
+    const int more = g_linger_tex.count != 0;
+    g_linger_sched = more;
+    os_unfair_lock_unlock(&g_linger_lk);
+    [gone removeAllObjects];
+    if (more) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_LINGER_NS),
+                             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_linger_sweep(); });
+}
+static void nvmtl_linger_schedule(void)
+{
+    os_unfair_lock_lock(&g_linger_lk);
+    const int go = !g_linger_sched && g_linger_tex.count; if (go) g_linger_sched = 1;
+    os_unfair_lock_unlock(&g_linger_lk);
+    if (go) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_LINGER_NS),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ nvmtl_linger_sweep(); });
+}
+// A wrap of this backing: it stays alive NVMTL_LINGER_NS from now (oldest dropped first past the count or bytes).
+static void nvmtl_linger_touch(NVMTLTexture *t)
+{
+    if (!t || !nvmtl_linger_on() || t->_i.alloc > NVMTL_LINGER_BYTES) return;
+    NSMutableArray *gone = [NSMutableArray new];
+    const uint64_t now = nvmtl_vram_keep_now();
+    os_unfair_lock_lock(&g_linger_lk);
+    if (!g_linger_tex) { g_linger_tex = [NSMutableArray new]; g_linger_at = [NSMutableArray new]; }
+    const NSUInteger at = [g_linger_tex indexOfObjectIdenticalTo:t];
+    if (at != NSNotFound) { [g_linger_tex removeObjectAtIndex:at]; [g_linger_at removeObjectAtIndex:at]; }
+    if (!nvmtl_linger_expired(t, now, now)) {
+        [g_linger_tex addObject:t]; [g_linger_at addObject:@(now)];
+        uint64_t bytes = 0; for (NVMTLTexture *x in g_linger_tex) bytes += x->_i.alloc;
+        while (g_linger_tex.count > NVMTL_LINGER_N || (bytes > NVMTL_LINGER_BYTES && g_linger_tex.count > 1)) {
+            NVMTLTexture *o = g_linger_tex[0]; bytes -= o->_i.alloc;
+            [gone addObject:o]; [g_linger_tex removeObjectAtIndex:0]; [g_linger_at removeObjectAtIndex:0];
+        }
+    }
+    os_unfair_lock_unlock(&g_linger_lk);
+    [gone removeAllObjects];
+    nvmtl_linger_schedule();
+}
 static char nvmtl_surface_cache_key;
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
@@ -1834,7 +2641,11 @@ static char nvmtl_surface_cache_key;
     // drawable. Request the real storage view before importing family VRAM;
     // the private fallback already makes eligible formats writable.
     if (!wantStex && nvmtl_surface_widen_usage(t->_fbo) && !a8 && nvmtl_vk_format_is_storage(vkf)) wantStex = 1;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    // The same seven values, packed as bytes: an NSArray key hashes to its element count, so every entry collided and each
+    // lookup (every wrap the window server makes) compared arrays against every entry, the dead weak ones included.
+    NSData *key = nil;
+    if (surf) { const uint64_t k7[7] = { IOSurfaceGetID(surf), plane, w, h, d.pixelFormat, t->_ropt, (uint64_t)t->_fbo };
+                key = [NSData dataWithBytes:k7 length:sizeof k7]; }
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Private and Managed tiled backings are local to this device. Repeated
     // wrappers of the same surface must share that image,
@@ -1845,6 +2656,7 @@ static char nvmtl_surface_cache_key;
         if (alias) {
             alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, alias->_stex); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
             nvmtl_texture_desc_swizzle(alias, d);
+            nvmtl_linger_touch(backing);
             return alias;
         }
     }
@@ -1857,7 +2669,7 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage == 1;
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && (!t->_vramOn || t->_surfaceLinear.img)) [cache setObject:t forKey:key];
+    if (key && (!t->_vramOn || t->_surfaceLinear.img)) { [cache setObject:t forKey:key]; nvmtl_linger_touch(t); }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
@@ -2829,7 +3641,13 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
             @"lod_min_clamp":@(sd.lodMinClamp),@"lod_max_clamp":@(sd.lodMaxClamp),
             @"border_color":(@[@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"])[MIN((NSUInteger)sd.borderColor,2u)],
             @"reduction":@"WeightedAverage",@"lod_bias":@0};
-        nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
+        // The dictionary's description is built only when the line can reach a log. WAS: on every call, for a log a
+        // release plugin drops unless the process opted in (NVMTL_PROCESS_ENV=1): WindowServer makes pixel samplers
+        // during animations and -[NSDictionary descriptionWithLocale:indent:] was 19 of the 23 main-thread samples
+        // in newSamplerStateWithDescriptor: (anim3 capture). The line holds no failure word, so release syslog never
+        // took it. NVMTL_SAMPLER_DESC_LAZY=0 builds it on every call again.
+        static int descLazy = -1; if (descLazy < 0) { const char *e = getenv("NVMTL_SAMPLER_DESC_LAZY"); descLazy = !(e && e[0] == '0'); }
+        if (!descLazy || !NVMTL_RELEASE || nvmtl_process_env_on()) nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
     }
     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);
     int repeat = (sd.sAddressMode == MTLSamplerAddressModeRepeat);
@@ -3080,8 +3898,39 @@ static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
         nvlog("QUERY supportsFamily %ld -> %s (%s; claim up to Apple%ld)", (long)f, yes ? "YES" : "NO", why, (long)nvmtl_apple_family_max());
     return yes;
 }
+// NVMTL_CA_APPLE3=1 (WindowServer only; 2 = any process, for tests; default 0 = off): answer YES to MTLGPUFamilyApple3 when,
+// and only when, Core Animation's context setup asks (the caller is QuartzCore's CA::OGL::new_metal_context).
+// Why: that setup stores the answer in its context, and on a GPU without Apple3 (every Intel/AMD Mac and this driver) the
+// context then waits for the GPU to finish everything (-[MTLCommandBuffer waitUntilCompleted] via MetalContext::finish)
+// on every 128th render-target switch within one frame (set_surface: switches % 128; every 64th it only commits). A
+// "show desktop" slide with many windows, sidebars and vibrancy passes 128 switches, and the compositor thread then sits
+// out the GPU's whole frame: 702 of 6826 samples of WindowServer's main thread in the anim2 capture were in that wait.
+// Measured with CARenderer (caprobe, 30 windows with backdrops, 161 switches a frame): 10.2 -> 2.8 ms wall per frame,
+// the same CPU, pixel-identical output. Nothing else about the device changes: Metal's own family queries (pixel-format
+// capability tables) still get NO. Inside Core Animation the bit also selects BGR10_XR for 'b3a8' IOSurfaces and one
+// extended-range image format, which this driver stores as 10:10:10:2 unorm (values above 1.0 clamp; Apple's XR bit
+// layout is not decoded), so extended-range (EDR) content could render differently - hence off by default.
+static int nvmtl_ca_apple3_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_CA_APPLE3"); const int v = e ? atoi(e) : 0;
+        const int ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+        on = v == 2 || (v == 1 && ws);
+        if (v) nvlog("NVMTL_CA_APPLE3=%d: Core Animation's context setup %s told Apple3 (no forced GPU wait every 128 render-target switches)",
+                     v, on ? "IS" : "is NOT (not WindowServer)");
+    }
+    return on;
+}
+static BOOL nvmtl_ca_apple3_caller(const void *ra)
+{
+    Dl_info di = {0};
+    return dladdr(ra, &di) && di.dli_fname && di.dli_sname && strstr(di.dli_fname, "/QuartzCore") && strstr(di.dli_sname, "new_metal_context");
+}
 - (BOOL)supportsFamily:(MTLGPUFamily)f {
     if (nvmtl_mfx_profile_depth && (NSInteger)f >= 1001 && (NSInteger)f <= 1009) return NO;
+    if ((NSInteger)f == 1003 && nvmtl_ca_apple3_on() && nvmtl_ca_apple3_caller(__builtin_return_address(0)))
+        return nvmtl_family_answer(f, YES, "Core Animation context setup only, NVMTL_CA_APPLE3");
     switch ((NSInteger)f) {
         case MTLGPUFamilyMac2: case MTLGPUFamilyCommon1: case MTLGPUFamilyCommon2: case MTLGPUFamilyCommon3: return YES;
         case 2001 : return YES;
@@ -3177,6 +4026,23 @@ static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
     e->_fields = fields; e->_fieldByIndex = nvmtl_index_argument_fields(fields);
     nvlog("newArgumentEncoderWithArguments: %lu descriptor(s) -> %lu field(s), %lu bytes", (unsigned long)args.count, (unsigned long)fields.count, (unsigned long)off);
     return e;
+}
+// The Metal 3 way to an encoder for a pipeline's argument buffer: from its reflection's buffer binding (VFX, which draws
+// Messages' animated chat backgrounds, asks this way). Without it the call reached the system's base class, whose fallback
+// (-newIndirectArgumentEncoderWithLayout:) aborts the process, so the extension crashed on launch and was relaunched in a
+// loop. A binding this driver reflected knows its function, which lays the encoder out from the AIR as
+// -newArgumentEncoderWithBufferIndex: does; any other binding gets nil, which an app can check, instead of an abort.
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)binding {
+    if ([(id)binding isKindOfClass:[NVMTLArgument class]]) {
+        NVMTLArgument *a = (NVMTLArgument *)binding;
+        NVMTLFunction *fn = a->_encFn;
+        id<MTLArgumentEncoder> e = fn ? [fn newArgumentEncoderWithBufferIndex:a->_index] : nil;
+        nvlog("newArgumentEncoderWithBufferBinding: \"%s\" buffer %lu of %s -> %p", a->_name.UTF8String ?: "-", (unsigned long)a->_index,
+              fn ? fn->_fname.UTF8String : "(function gone)", (__bridge void *)e);
+        return e;
+    }
+    { static int said; if (said++ < 4) nvlog("newArgumentEncoderWithBufferBinding: a %s binding (not reflected by this driver) - nil", object_getClassName(binding)); }
+    return nil;
 }
 - (NSUInteger)currentAllocatedSize { return (NSUInteger)nvmtl_vk_allocated_bytes(); }
 - (uint64_t)recommendedMaxWorkingSetSize {

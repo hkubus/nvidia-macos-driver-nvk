@@ -29,7 +29,8 @@ static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
     NVMTLHeap *_subHeap; NSUInteger _subCharge; BOOL _aliased;
     nvk_buffer _shadow; int _syncOut; int _zshadow;
     void *_swc;   /* nvmtl_swc*: this Shared buffer has a VRAM working copy (_b) and its system-memory side in _shadow */
-    NSUInteger _dirtyLo, _dirtyHi; } @end
+    NSUInteger _dirtyLo, _dirtyHi;
+    NSUInteger *_dirtyR; unsigned _dirtyN, _dirtyCap;   /* Managed: the [lo, hi) ranges didModifyRange named since the last upload (pairs) */ } @end
 #include <sched.h>
 static inline void nvmtl_buf_settle(NVMTLBuffer *b) {
     if (!__atomic_load_n(&b->_zshadow, __ATOMIC_ACQUIRE)) return;
@@ -57,6 +58,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
   nvk_buffer _vramBuf; BOOL _vramOn; uint64_t _vramBorn;   // _vramBorn: when _vramBuf was imported (nvmtl_vram_keep_put)
   nvk_image _surfaceLinear;   // Managed IOSurface: shared publication image; _i is its coherent tiled GPU backing
   nvk_buffer _hostPages;   // this surface's pages imported for the host copies (nvmtl_host_pages), kept while they hold
+  uint32_t _sparkKey[8]; BOOL _sparkable, _sparkPlain;   // a private surface image (or, _sparkPlain, a plain texture): parked for the next one of this shape (nvmtl_ipark_put)
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;
@@ -84,13 +86,14 @@ uint64_t nvmtl_resid_for_sampler(id s);
 @interface NVMTLStructType : NVMTLType { @public NSArray *_members; } @end
 @interface NVMTLPointerType : NVMTLType { @public MTLDataType _elem; MTLBindingAccess _access; NSUInteger _align, _size; BOOL _isArgBuf; NVMTLStructType *_elemStruct; } @end
 // an array member of a reflected struct (MTLArrayType): element type, length and stride from the AIR struct_type_info
-@interface NVMTLArrayType : NVMTLType { @public MTLDataType _elem; NSUInteger _len, _stride; } @end
+@interface NVMTLArrayType : NVMTLType { @public MTLDataType _elem; NSUInteger _len, _stride; NVMTLStructType *_elemStruct; } @end
 @interface NVMTLStructMember : NSObject { @public NSString *_name; NSUInteger _offset; MTLDataType _dataType; NSUInteger _argIndex; NVMTLArrayType *_arr;
   NVMTLStructType *_struct; NVMTLTextureReferenceType *_texRef; NVMTLPointerType *_ptr; } @end
 // _type holds MTLArgumentType values in its underlying NSUInteger; MTLBindingType, the replacement, numbers them the same
 @interface NVMTLArgument : NSObject { @public NSString *_name; NSUInteger _type; MTLBindingAccess _access; NSUInteger _index; BOOL _active;
   NSUInteger _arrayLength, _bufAlign, _bufSize; MTLDataType _bufDataType; NVMTLStructType *_bufStruct; NVMTLPointerType *_bufPtr;
-  MTLTextureType _texType; MTLDataType _texDataType; BOOL _depth; } @end
+  MTLTextureType _texType; MTLDataType _texDataType; BOOL _depth;
+  __weak NVMTLFunction *_encFn; } @end   // a buffer binding's function: -newArgumentEncoderWithBufferBinding: encodes for it
 @interface NVMTLRenderPipelineReflection : NSObject { @public NSArray *_v, *_f, *_o, *_m; } @end
 @interface NVMTLComputePipelineReflection : NSObject { @public NSArray *_a; } @end
 NSArray<NVMTLArgument *> *nvmtl_arguments_for_function(NVMTLFunction *fn);
@@ -115,6 +118,7 @@ static inline uint32_t nvmtl_vk_layers_for_desc(uint32_t t, uint32_t n, uint32_t
   int64_t *_offAt; NSUInteger _offN;
   NVMTLBuffer *_dst; NSUInteger _dstOffset; NSString *_label;
   NSUInteger _airSize, _airAlign;
+  NSUInteger _encLen;   /* encodedLength, kept after its first answer (0: not yet; NVMTL_AE_FAST) */
 } @end
 extern id gNVMTLMainDevice;
 @interface NVMTLLibrary : NSObject <MTLLibrary> { @public NSDictionary<NSString *, NSData *> *_fns; NSMutableDictionary<NSString *, NSData *> *_compiledFns; NSDictionary<NSString *, NSString *> *_stages, *_airs; NSArray<NSString *> *_externs;
@@ -261,7 +265,7 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
 @end
 
 NSArray<NSDictionary *> *nvmtl_embedded_bindings(NVMTLFunction *function);
-void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt);
+void nvmtl_bind_embedded(__unsafe_unretained NVMTLCommandBuffer *cb, uint32_t set, __unsafe_unretained NVMTLFunction *fn, NVMTLBuffer *__strong const *bufAt, const NSUInteger *offAt);
 void nvmtl_bind_embedded_enc(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NVMTLComputeCommandEncoder *e);
 // the NSArray form of one binding ({buffer, offset} or {buffer, offset, length, base}), for the few readers that want it
 static inline NSArray *nvmtl_bufat(NVMTLComputeCommandEncoder *e, NSUInteger i) {
@@ -299,10 +303,13 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void);
 } @end
 void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 #include <os/lock.h>
-@interface NVMTLResSet : NSMutableSet { @public NSMutableSet *_s; os_unfair_lock _lk; const void *_mru[8]; unsigned _mruNext; }
+#define NVMTL_RESSET_DM 128   /* NVMTLResSet's direct-mapped member cache (NVMTLObjects.m) */
+@interface NVMTLResSet : NSMutableSet { @public NSMutableSet *_s; os_unfair_lock _lk; const void *_mru[8]; unsigned _mruNext; const void *_dm[NVMTL_RESSET_DM]; }
 - (NVMTLResSet *)nvmtlTakeAll;
 @end
 @interface NVMTLFunction () { @public NSString *_label; } @end
+// The per-draw binding plan (NVMTLEmbedded.m, nvmtl_bind_plan): built once, published with release order, owned by _bindPlanData.
+@interface NVMTLFunction () { @public const void *_bindPlan; NSData *_bindPlanData; } @end
 // machine code compiled ahead of time for this function (NVMTLSass.m), nil otherwise
 @interface NVMTLFunction () { @public id _sassKernel; } @end
 @interface NVMTLLibrary () { @public NSString *_label; } @end

@@ -65,9 +65,19 @@ static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t)
 #ifndef nvtrace
 static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #endif
-static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
+// How many pending-write records exist (all queues), for the IOSurfaceLock wait's lock-free early out. Written under the
+// command-buffer class lock after every change to nvmtl_surface_writers.
+static _Atomic unsigned long nvmtl_surface_writes_live;
+static void nvmtl_surface_writes_recount(void) {
+    unsigned long n = 0;
+    for (id queue in nvmtl_surface_writers.keyEnumerator) n += [(NSDictionary *)[nvmtl_surface_writers objectForKey:queue] count];
+    atomic_store_explicit(&nvmtl_surface_writes_live, n, memory_order_release);
+}
+// Returns YES when cb writes an IOSurface.
+static BOOL nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
     // The same lock as pending_write and finish_writes, taken here too: the map is shared with the completion thread, and
     // its one caller holding this (recursive) lock today must not be what keeps WindowServer's heap intact.
+    BOOL any = NO;
     @synchronized ([NVMTLCommandBuffer class]) {
         if (!nvmtl_surface_writers) nvmtl_surface_writers = [NSMapTable weakToStrongObjectsMapTable];
         NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
@@ -77,8 +87,11 @@ static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
             NVMTLPendingSurfaceWrite *write = [NVMTLPendingSurfaceWrite new];
             write->buffer = cb; write->texture = t; write->seed = IOSurfaceGetSeed(t->_surf);
             writes[nvmtl_surface_writer_key(t)] = write;
+            any = YES;
         }
+        if (any) nvmtl_surface_writes_recount();
     }
+    return any;
 }
 // WindowServer frame completion, with NVAccel's nvSurfGpuEscape: each surface a WindowServer command buffer renders is
 // marked pending when it commits and ready when the GPU has finished it, and the swap waits for that in the kernel, off
@@ -279,7 +292,94 @@ static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
             if (!write->buffer || write->buffer == cb) [writes removeObjectForKey:key];
         }
         if (!writes.count) [nvmtl_surface_writers removeObjectForKey:cb->_queue];
+        nvmtl_surface_writes_recount();
     }
+}
+// IOSurfaceLock waits for this process's GPU writes. On Apple's drivers a normal IOSurfaceLock (anything but
+// kIOSurfaceLockAvoidSync) waits until the GPU has finished every write to the surface already committed, so an app may
+// commit a render into a surface and lock it for the CPU at once. Browsers do exactly that: ANGLE's glFlush commits the
+// WebGL / accelerated-canvas frame into its IOSurface, and Firefox's software WebRender (hardware compositing off) maps
+// that surface under IOSurfaceLock(ReadOnly) right after, on another thread of the same process. Here the kernel only
+// waits for WindowServer's own pending marks (nvSurfGpuEscape takes no other process's), and an app's surface is marked
+// newest in VRAM only when its part has landed (nvmtlSurfaceOut), so until then the lock found the old system copy
+// current and the CPU read the previous frame, or zeros (fully transparent: the white page behind it) from a surface
+// made at a new size - canvases and WebGL views flashing white or stale while things were resized.
+// Measured (slow/agents/glitch/bin/anglesurf 300 6 flush 0: Firefox 160's ANGLE draws 6 tiles into pooled IOSurfaces,
+// one changing size every frame, glFlush, then IOSurfaceLock(ReadOnly) and 256 points per tile): 75-98% of the reads
+// (about 30% of the points) were wrong, the same on the 2.9 base, integ6 and opt-surfaces, with or without 6 ms between
+// frames; every read of a newly sized surface was all zeros. glFinish instead of glFlush: none. With this wait: 0 of
+// 1200 reads in each of 6 runs (NVMTL_SURFLOCK_WAIT=0 brings the failures back). Metal alone (pool gpucheck: commit,
+// no wait, lock and read): 440-3253 of 614400 points wrong -> 0.
+// Now, outside WindowServer, IOSurfaceLock is rebound in every image outside the shared cache (Firefox's XUL, Chromium
+// and Electron frameworks, ANGLE) as each one loads, from the first commit that writes an IOSurface on. A lock without
+// kIOSurfaceLockAvoidSync first waits, at most NVMTL_SURFLOCK_WAIT_MS, for the command buffers of this process that
+// still have a committed write to that surface in flight (nvmtl_surface_writers: registered at commit, removed once the
+// write is published), then takes the real lock, whose page-off then copies the finished VRAM. A lock with no such write
+// in flight costs one atomic load. Not covered: system frameworks in the shared cache (their calls to IOSurfaceLock are
+// bound inside the cache) and a reader in another process. NVMTL_SURFLOCK_WAIT=0 turns it off.
+#define NVMTL_SURFLOCK_WAIT_MS 500
+static unsigned long long nvmtl_surflock_waited, nvmtl_surflock_late;
+static void nvmtl_surface_lock_wait(IOSurfaceRef surf) {
+    if (!surf || !atomic_load_explicit(&nvmtl_surface_writes_live, memory_order_acquire)) return;
+    const uint32_t sid = IOSurfaceGetID(surf);
+    size_t planes = IOSurfaceGetPlaneCount(surf); if (!planes) planes = 1; if (planes > 256) planes = 256;
+    NSMutableArray<NVMTLCommandBuffer *> *writers = nil;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        for (id queue in nvmtl_surface_writers.keyEnumerator) {
+            NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
+            for (size_t p = 0; p < planes; p++) {
+                NVMTLPendingSurfaceWrite *write = writes[@(((unsigned long long)sid << 8) | p)];
+                NVMTLCommandBuffer *cb = write ? write->buffer : nil; NVMTLTexture *t = write ? write->texture : nil;
+                // the writer's texture holds its surface, so a live record with this ID is this surface
+                if (!cb || !t || !t->_surf || IOSurfaceGetID(t->_surf) != sid) continue;
+                if (!writers) writers = [NSMutableArray new];
+                if ([writers indexOfObjectIdenticalTo:cb] == NSNotFound) [writers addObject:cb];
+            }
+        }
+    }
+    if (!writers) return;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:NVMTL_SURFLOCK_WAIT_MS / 1000.0];
+    BOOL late = NO;
+    for (NVMTLCommandBuffer *cb in writers) {
+        [cb->_completionCondition lock];
+        while (!cb->_executionDone && !cb->_completionReady && !late) late = ![cb->_completionCondition waitUntilDate:deadline];
+        [cb->_completionCondition unlock];
+    }
+    const unsigned long long n = __atomic_add_fetch(late ? &nvmtl_surflock_late : &nvmtl_surflock_waited, 1, __ATOMIC_RELAXED);
+    if (late || n < 4 || !(n & (n - 1)))
+        nvlog("IOSurfaceLock of surface %u %s its GPU write (%llu waited, %llu gave up after %d ms)", sid,
+              late ? "gave up waiting for" : "waited for", nvmtl_surflock_waited, nvmtl_surflock_late, NVMTL_SURFLOCK_WAIT_MS);
+}
+static IOReturn nvmtl_iosurface_lock(IOSurfaceRef surf, IOSurfaceLockOptions options, uint32_t *seed) {
+    if (!(options & kIOSurfaceLockAvoidSync)) nvmtl_surface_lock_wait(surf);
+    return IOSurfaceLock(surf, options, seed);   // this image's own import is never rebound
+}
+static int nvmtl_surflock_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_SURFLOCK_WAIT"), *me = getprogname();
+        const int ws = me && !strcmp(me, "WindowServer");
+        on = !(e && e[0] == '0') && !ws;
+        nvlog("IOSurfaceLock %s (NVMTL_SURFLOCK_WAIT=%s)", on ? "waits for this process's committed GPU writes to the surface"
+              : ws ? "left alone in WindowServer (the kernel waits for its pending marks)" : "OFF: a lock can read a surface the GPU is still writing", e ?: "unset");
+    }
+    return on;
+}
+static void nvmtl_surflock_image_added(const struct mach_header *mh, intptr_t slide) {
+    (void)slide;
+    if (!mh || mh->magic != MH_MAGIC_64 || (mh->flags & MH_DYLIB_IN_CACHE)) return;
+    static const void *self; static dispatch_once_t once;
+    dispatch_once(&once, ^{ Dl_info di; self = dladdr((const void *)nvmtl_surflock_image_added, &di) ? di.dli_fbase : NULL; });
+    if ((const void *)mh == self) return;
+    Dl_info di; const char *path = dladdr(mh, &di) ? di.dli_fname : NULL;
+    if (path && (strstr(path, "/GPUBundles/") || strstr(path, "NVMTLDriver.bundle/"))) return;   // the driver's own libraries
+    const int n = nvmtl_rebind_import(mh, "_IOSurfaceLock", (void *)nvmtl_iosurface_lock);
+    if (n > 0) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 16) nvlog("IOSurfaceLock rebound in %s (%d slot(s))", path ?: "?", n); }
+}
+static void nvmtl_surflock_install(void) {
+    static dispatch_once_t once;
+    if (!nvmtl_surflock_on()) return;
+    dispatch_once(&once, ^{ _dyld_register_func_for_add_image(nvmtl_surflock_image_added); });   // runs now for every loaded image too
 }
 
 @implementation NVMTLSubmissionPart
@@ -313,13 +413,42 @@ static int nvmtl_skip_empty_on(void) {
     return on;
 }
 
+// The busy-count walk (commit, completion) and the copy-backed-buffer walk (nvmtl_submission_copies) read a sealed
+// part's resource set: one nvmtlTakeAll made, that nothing adds to or removes from again, and that the part (and the
+// command buffer) holds. Fast enumeration of an NVMTLResSet first copies its members into an owned array - a retain,
+// an array insert and a release per member - because an encoder's live set can change under another thread. In
+// WindowServer's anim3 capture that copy was 9 of the 15 main-thread samples under the commit's busy-count raise, and
+// 16 of the 25 execution-worker samples under nvmtl_submission_copies, which the worker runs before a part's
+// vkQueueSubmit and again after a part with copy-backed buffers lands, both on the way to the next "scheduled" the
+// compositor waits for. These walks visit the set in place under its lock; the visitor only reads the member and
+// touches atomics or a local collection, so it never takes another lock. wsloop with 300 extra textures per frame
+// (interleaved, 6 runs each, medians of per-run p50): commit CPU 61.2 -> 54.0 us/frame, blocked in waitUntilScheduled
+// 59.4 -> 52.0 us/frame, composite commit-to-scheduled 30.9 -> 25.0 us. NVMTL_RESSET_DIRECT=0: walk the snapshot.
+static int nvmtl_resset_direct_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_RESSET_DIRECT"); on = !(e && e[0] == '0');
+        nvlog("commit: sealed resource sets are walked %s (NVMTL_RESSET_DIRECT=%s)", on ? "in place under their lock" : "through a snapshot", e ? e : "unset"); }
+    return on;
+}
+static void nvmtl_resset_each(NSSet *set, void (NS_NOESCAPE ^visit)(__unsafe_unretained id o)) {
+    if (!set) return;
+    if (object_getClass(set) == [NVMTLResSet class] && nvmtl_resset_direct_on()) {
+        NVMTLResSet *rs = (NVMTLResSet *)set;
+        os_unfair_lock_lock(&rs->_lk);
+        for (id o in rs->_s) visit(o);
+        os_unfair_lock_unlock(&rs->_lk);
+        return;
+    }
+    for (id o in set) visit(o);
+}
+
 // MTLResourceSPI's isComplete (Apple's OpenGL asks it before it changes a texture from the CPU) answers for command
 // buffers that were committed: a use only encoded does not make a resource busy, and a command buffer that is never
 // committed never holds it. A commit raises the count of every buffer and texture its last part holds - each earlier
 // part's resources are put back into the recording (nvmtlSealPartWithSignal restart), so the last part names them all -
 // on the texture that owns the storage, and on the buffer under a texture made over one, which the GPU reads too.
 static void nvmtl_gpu_uses_adjust(NSSet *resources, int delta) {
-    for (id o in (NVMTLResSet *)resources) {
+    nvmtl_resset_each(resources, ^(__unsafe_unretained id o) {
         NVMTLBuffer *b = nil;
         if ([o isKindOfClass:[NVMTLTexture class]]) {
             NVMTLTexture *t = o, *own = t->_parent ?: t;
@@ -327,7 +456,7 @@ static void nvmtl_gpu_uses_adjust(NSSet *resources, int delta) {
             b = own->_backBuf ?: t->_backBuf;
         } else if ([o isKindOfClass:[NVMTLBuffer class]]) b = o;
         if (b) __atomic_add_fetch(&b->_gpuRefs, delta, __ATOMIC_ACQ_REL);
-    }
+    });
 }
 static void nvmtl_gpu_uses_raise(NVMTLCommandBuffer *cb, NVMTLSubmissionPart *last) {
     if (![last isKindOfClass:[NVMTLSubmissionPart class]] || !last->resources.count) return;
@@ -374,6 +503,8 @@ static void nvmtl_gpu_uses_lower(NVMTLCommandBuffer *cb) {
     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
     [_parts addObject:part];
     [_surfDirty removeAllObjects]; [_scratch removeAllObjects];
+    // the bounce scratch went with the part, which frees it when it completes: the next part makes its own
+    _nvBounce = nil; _nvBounceTop = 0;
     // The repeated-setBytes cache points at ring chunks without owning them; the part now owns those chunks and frees
     // them when it completes, which can happen while this command buffer is still being encoded. A cache entry that
     // outlived its chunk was bound and retained again by the next identical setBytes, and the compute encoder's binding
@@ -550,7 +681,7 @@ static BOOL nvmtl_surface_schedule_after_publish(NVMTLCommandBuffer *cb) {
     // buffers it filled, and any resources still listed on it. Apple's command buffers do the same. An app's
     // autorelease pool can keep thousands of finished command buffers alive during a long loop (Geekbench 7 does),
     // and holding these until the command buffer itself died filled VRAM until allocations were refused.
-    [_scratch removeAllObjects]; _e78Ring = nil; _e78RingOff = 0; memset(_g79BRing, 0, sizeof _g79BRing);
+    [_scratch removeAllObjects]; _e78Ring = nil; _e78RingOff = 0; _nvBounce = nil; _nvBounceTop = 0; memset(_g79BRing, 0, sizeof _g79BRing);
     [(NVMTLResSet *)_resources removeAllObjects]; [_stTwins removeAllObjects];
     // Applications may retain completed command buffers. Pending overwrite
     // bookkeeping must not keep their IOSurfaces and VRAM alive indefinitely.
@@ -618,25 +749,26 @@ static void nvmtl_gsub_census(void) {
 // A texture over a copy-backed buffer must refresh the same bytes as a direct
 // buffer binding. Keep direct managed-buffer writeback and copy each backing once.
 static NSArray<NVMTLBuffer *> *nvmtl_submission_copies(NSSet *resources, BOOL writtenOnly) {
-    NSMutableSet<NVMTLBuffer *> *copies = nil;
-    for (id resource in resources) {
-        if ([resource isKindOfClass:[NVMTLHeapPin class]]) {   // a used heap: its members with a host copy
-            NVMTLHeapPin *pin = resource;
-            NSArray *nested = nvmtl_submission_copies([NSSet setWithArray:[pin allCopyCandidates]], writtenOnly);
-            if (nested.count) { if (!copies) copies = [NSMutableSet new]; [copies addObjectsFromArray:nested]; }
-            continue;
-        }
+    __block NSMutableSet<NVMTLBuffer *> *copies = nil;
+    __block NSMutableArray<NVMTLHeapPin *> *pins = nil;
+    nvmtl_resset_each(resources, ^(__unsafe_unretained id resource) {
+        // a used heap: its members with a host copy, gathered after the walk (a heap pin's lists are its own business)
+        if ([resource isKindOfClass:[NVMTLHeapPin class]]) { if (!pins) pins = [NSMutableArray new]; [pins addObject:resource]; return; }
         NVMTLBuffer *buffer = nil;
         if ([resource isKindOfClass:[NVMTLBuffer class]]) buffer = resource;
         else if ([resource isKindOfClass:[NVMTLTexture class]]) {
             NVMTLTexture *texture = resource;
             if (writtenOnly && texture->_usage != MTLTextureUsageUnknown &&
-                !(texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) continue;
+                !(texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) return;
             buffer = texture->_backBuf ?: (texture->_parent ? texture->_parent->_backBuf : nil);
         }
-        if (!buffer || (!buffer->_hostPtr && !buffer->_shadow.map)) continue;
+        if (!buffer || (!buffer->_hostPtr && !buffer->_shadow.map)) return;
         if (!copies) copies = [NSMutableSet new];
         [copies addObject:buffer];
+    });
+    for (NVMTLHeapPin *pin in pins) {
+        NSArray *nested = nvmtl_submission_copies([NSSet setWithArray:[pin allCopyCandidates]], writtenOnly);
+        if (nested.count) { if (!copies) copies = [NSMutableSet new]; [copies addObjectsFromArray:nested]; }
     }
     return copies.allObjects;
 }
@@ -651,9 +783,24 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
     }
     part->copyInputsPrepared = YES;
 }
+// A command buffer whose finish path has begun (_partsRetiring, set under the class lock before _executionDone) has nothing
+// left for the pass to submit: every part it will ever run is already on the GPU, and the finish path drops the rest. The
+// pass used to stop at it, and with it every later command buffer on the queue, until the worker had released its
+// reservation and come back from its next fence wait. A WindowServer-style loop (wsloop, diagnostic build) caught commits
+// landing in that window waiting 1.3-2.4 ms for "scheduled" instead of ~20 us. The pass now steps over such a command
+// buffer without reading its parts, so a part the finish path has passed is still never submitted (I-069). Completion
+// order is unchanged: the worker still retires command buffers in reservation order.
+// NVMTL_AHEAD_PAST_DONE=0: stop at it, as before.
+static BOOL nvmtl_ahead_past_done_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_AHEAD_PAST_DONE"); on = !(e && e[0] == '0');
+        nvlog("commit: submit-ahead %s a command buffer that is finishing (NVMTL_AHEAD_PAST_DONE=%s)", on ? "steps over" : "stops at", e ? e : "unset"); }
+    return on;
+}
 - (BOOL)nvmtlSubmitAhead {
+    if (_executionDone || _partsRetiring) return nvmtl_ahead_past_done_on();
     // a commit still putting its kernel marks in (nvmtlSubmitWithEvents) must not reach the GPU before them
-    if (_executionDone || _partsRetiring || _cbError || !_committed || _commitMarking) return NO;
+    if (_cbError || !_committed || _commitMarking) return NO;
     if (_nextSubmit < _nextPart) _nextSubmit = _nextPart;
     while (_nextSubmit < _parts.count) {
         if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;
@@ -834,13 +981,16 @@ static void nvmtl_gsub_ahead_pass1(void) {
     // (_commitMarking stops the submit-ahead pass) or completes it (it is not pending yet) before its marks are in.
     nvmtl_ws_mark_pending(self);
     _scheduleAfterPublish = nvmtl_surface_schedule_after_publish(self);
+    BOOL writesSurface;
     @synchronized ([NVMTLCommandBuffer class]) {
         _commitMarking = NO;
-        nvmtl_surface_register_writes(self);
+        writesSurface = nvmtl_surface_register_writes(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
         nvmtl_pump_buffers();
     }
+    // outside the class lock: the image walk takes dyld's lock
+    if (writesSurface) nvmtl_surflock_install();
 }
 @end
 

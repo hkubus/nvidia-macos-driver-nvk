@@ -27,6 +27,7 @@ typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; 
                  uint8_t hz_ut;
                  uint8_t linear; /* buffer alias: 1 = 128-byte aligned, 2 = shadow required even without mixed tiling */
                  uint8_t alias_a8; /* component mapping of the base image view */
+                 uint8_t mtype1;   /* device-local memory type + 1 of the image's own allocation (create_typed, reback, migrate); 0 unknown: never lent to another image */
                  void *sparse; /* optional sparse-image state, alongside the fork alias metadata */
                } nvk_image;   /* hazard model: 0 not yet known, 1 tracked, 2 untracked (Metal hazardTrackingMode) */
 #define NVMTL_NVAR 16
@@ -63,6 +64,12 @@ typedef struct { void *rp; void *pipe; void *layout; int has_depth; uint32_t dfm
     uint32_t gl_uniform_layout, gl_uniform_slot[2], gl_uniform_range[2], gl_uniform_tracked;
     uint32_t db_dyn;   /* the depth bounds test and its range are dynamic state of this pipeline (depth attachment + depthBounds feature) */
     uint32_t view_mask;   /* multiview: the views this pipeline's render pass runs (vertex amplification), 0 for an ordinary pass */
+    /* compute: set-0 buffer bindings 0-31 the final module still reads through a storage-buffer descriptor (address
+       lowering kept them), and those of them it declares NonWritable. A slot of these bound at an offset Vulkan cannot
+       put in a descriptor runs on an aligned copy (nvmtl_vk_bounce_plan). sb_wild: the module may write memory other
+       than those slots (a store through an address, an image write, anything the scan cannot place), so an encoder's
+       kept read-only copies cannot outlive one of its dispatches. */
+    uint32_t sb_desc, sb_ro, sb_wild;
 } nvk_pipeline;
 void nvmtl_vk_pipeline_destroy(nvk_pipeline *p);
 typedef struct { void *pool; nvk_buffer stage; } nvk_queue;
@@ -359,13 +366,23 @@ int nvmtl_vk_pre_open(void);
 int nvmtl_vk_pre_copy(nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int nvmtl_vk_pre_fill(nvk_buffer *b, size_t offset, size_t size, uint32_t word);
 void nvmtl_vk_pre_hold(void *retained);
+int nvmtl_vk_pre_clear_image(nvk_image *img, uint32_t from, uint32_t to, const float rgba[4]);
+int nvmtl_vk_cmd_clear_image_to(nvk_cmdbuf *c, nvk_image *img, uint32_t from, uint32_t to, const float rgba[4]);
 extern void (*nvmtl_pre_release_hook)(void *);
 extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
 int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
 int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
+/* The same copy, submitted without waiting (nvmtl_vk_surfin_async_on): 0 when it is in flight, its handle on the image
+   (finished before a readback, re-upload, park or destroy of the image); done(ctx) runs once it has completed and been
+   finished. Non-zero: nothing was submitted and ctx is still the caller's. */
+int  nvmtl_vk_image_write_host_async(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache,
+                                     void (*done)(void *), void *ctx);
+int  nvmtl_vk_surfin_async_on(void);
 int  nvmtl_vk_image_read_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
 void nvmtl_vk_host_pages_drop(nvk_buffer *cache);
+void nvmtl_vk_host_pages_uncount(const nvk_buffer *cache);   /* out of the page cap's count; the caller destroys it later */
+extern size_t (*nvmtl_host_pages_shed_hook)(const void *base, size_t bytes);   /* the plugin's: frees at least `bytes` of kept surface pages, or none */
 /* The surface and cookie the next host-page copy on this thread belongs to (cookie 0 = none): lets wrappers of one surface share an import (NVMTL_HOST_PAGES_SHARE=1). */
 void nvmtl_vk_host_pages_key(uint32_t surface_id, uint64_t cookie);
 int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
@@ -534,10 +551,19 @@ size_t nvmtl_vk_allocated_bytes(void);
 uint64_t nvmtl_vk_buffer_address(nvk_buffer *b);
 
 int nvmtl_vk_image_create_typed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_image *out);
+/* The same, but a released image of another shape may lend its memory (NVMTLDevice.m nvmtl_tpark_donor): donor(need, mtype1, &d)
+   answers 0 and an idle parked image whose own allocation is at least need bytes of memory type mtype1 - 1. The new image is
+   bound to that memory instead of a new allocation; the lender's image and view, without the memory, come back in *shell
+   for the caller to destroy (nvmtl_vk_image_destroy leaves a NULL mem alone). donor NULL: nvmtl_vk_image_create_typed. */
+typedef int (*nvmtl_vk_donor_fn)(uint64_t need, uint32_t mtype1, nvk_image *out);
+int nvmtl_vk_image_create_typed_from(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers,
+                                     nvmtl_vk_donor_fn donor, nvk_image *shell, nvk_image *out);
 typedef struct { void *mem; void *map; size_t size; uint32_t memtype; int host_visible; } nvk_heap;
 int  nvmtl_vk_heap_create(size_t size, int host_visible, nvk_heap *out);
 void nvmtl_vk_image_parked(nvk_image *i);     /* the image went to a park for reuse (alive, recyclable) */
 void nvmtl_vk_image_recycled(nvk_image *i);   /* a parked image was taken back into use */
+uint64_t nvmtl_vk_release_horizon(void);      /* the submit a resource released now must outlive */
+uint64_t nvmtl_vk_finished_seq(void);         /* the newest submit known complete */
 int nvmtl_vk_heap_zero(nvk_heap *h, const char *what);   /* clear a fresh heap to zero before its first placement (NVMTL_HEAP_ZERO) */
 int  nvmtl_vk_format_block(uint32_t vkfmt, uint32_t *bw, uint32_t *bh, uint32_t *block_bytes);
 static inline uint32_t nvmtl_vk_layers_for_type(uint32_t t, uint32_t n) { n = n ? n : 1; return (t == 1 || t == 3 || t == 8) ? n : t == 5 ? 6u : t == 6 ? 6u * n : 1u; }
@@ -571,6 +597,21 @@ int nvmtl_vk_cmd_fill_buffer(nvk_cmdbuf *c, nvk_buffer *b, size_t offset, size_t
 int nvmtl_vk_cmd_write_word(nvk_cmdbuf *c, nvk_buffer *b, size_t offset, uint32_t word);
 
 int nvmtl_vk_cmd_copy_buffer(nvk_cmdbuf *c, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
+/* Misaligned storage-buffer descriptors of a compute dispatch (nvmtl_vk.c, "Bounce"): the plan names the groups of
+   slots p reads through a descriptor while they are bound at an offset that is not a multiple of 16; each group is one
+   buffer's bytes from its lowest slot offset to the buffer's end. bounce_in copies a group's bytes from g->base into
+   scratch at soff (16-aligned) and binds its slots there; bounce_bind only binds them, to a copy made earlier whose
+   byte g->base sits at soff; bounce_out copies the group back (unless every slot is read-only; scratch may then be
+   NULL) and rebinds the slots to the app's buffer. slots_hold: a set-0 buffer slot in mask holds the buffer h. */
+typedef struct { void *h; size_t size, base, len; uint32_t slots, ro; size_t off[32]; uint64_t address[32]; } nvmtl_bounce;
+uint32_t nvmtl_vk_bounce_plan(nvk_cmdbuf *c, const nvk_pipeline *p, nvmtl_bounce *out, uint32_t max);
+int nvmtl_vk_bounce_in(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff);
+int nvmtl_vk_bounce_bind(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff);
+int nvmtl_vk_bounce_out(nvk_cmdbuf *c, const nvmtl_bounce *g, nvk_buffer *scratch, size_t soff);
+int nvmtl_vk_slots_hold(nvk_cmdbuf *c, uint32_t mask, const void *h);
+int nvmtl_vk_bounce_on(void);
+int nvmtl_vk_bounce_keep_on(void);
+void nvmtl_vk_bounce_hit(void);
 
 int nvmtl_vk_cmd_copy_image(nvk_cmdbuf *c, nvk_image *src, uint32_t sx, uint32_t sy,
                         nvk_image *dst, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);

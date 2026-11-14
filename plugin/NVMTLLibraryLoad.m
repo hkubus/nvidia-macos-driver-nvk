@@ -73,7 +73,28 @@ int nvmtl_vk_lost(void);
 static char gXlateTag[NVMTL_SPVCACHE_TAG_MAX] = "untagged";
 // The translator build alone, without the mode suffixes (-u2, -p5, ...) gXlateTag adds: the stale-entry sweep keys on it.
 static char gXlateBuildTag[NVMTL_SPVCACHE_TAG_MAX] = "untagged";
+static NSString *nvmtl_spvcache_dir(void);
+// The tag is the SHA-256 of the whole translator (15 MB), and reading and hashing it cost ~20 ms in every process that
+// translates a shader, every launch. The digest is kept in the cache folder under the file's identity - device, inode,
+// size, modification and change time - so the same file is hashed once; replacing or rewriting the library changes that
+// identity and the next process hashes it again. The name starts with a dot, so neither the trim nor the stale-entry
+// sweep (which deletes only .c3.spv entries) touches it. A process whose cache folder is not writable hashes as before.
+static NSString *nvmtl_translator_tag_memo_path(const char *path) {
+    struct stat st; NSString *dir = nvmtl_spvcache_dir();
+    if (!dir || stat(path, &st) != 0) return nil;
+    return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@".xlate-tag-%llx-%llx-%llx-%ld.%09ld-%ld.%09ld",
+            (unsigned long long)st.st_dev, (unsigned long long)st.st_ino, (unsigned long long)st.st_size,
+            (long)st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec, (long)st.st_ctimespec.tv_sec, st.st_ctimespec.tv_nsec]];
+}
+static BOOL nvmtl_translator_tag_valid(NSString *s) {
+    if (s.length != 7 + 2 * CC_SHA256_DIGEST_LENGTH || ![s hasPrefix:@"sha256-"]) return NO;
+    for (NSUInteger i = 7; i < s.length; i++) { const unichar c = [s characterAtIndex:i]; if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return NO; }
+    return YES;
+}
 static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capacity) {
+    NSString *memo = nvmtl_translator_tag_memo_path(path);
+    NSString *kept = memo ? [NSString stringWithContentsOfFile:memo encoding:NSASCIIStringEncoding error:nil] : nil;
+    if (nvmtl_translator_tag_valid(kept) && kept.length < capacity) { strlcpy(tag, kept.UTF8String, capacity); return; }
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     CC_SHA256_CTX context; CC_SHA256_Init(&context);
     BOOL complete = fd >= 0; uint8_t buffer[65536];
@@ -92,6 +113,7 @@ static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capac
         char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
         for (size_t i = 0; i < sizeof digest; ++i) snprintf(hex + 2*i, 3, "%02x", digest[i]);
         snprintf(tag, capacity, "sha256-%s", hex);
+        if (memo) [@(tag) writeToFile:memo atomically:YES encoding:NSASCIIStringEncoding error:nil];
     } else {
         snprintf(tag, capacity, "private-%d-%llx", getpid(),
                  (unsigned long long)clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW));
@@ -2177,7 +2199,11 @@ static NSString *nvmtl_air_quoted_before(NSString *line, NSUInteger at, NSUInteg
     if (start) *start = q.location;
     return [line substringWithRange:NSMakeRange(q.location + 2, at - 1 - (q.location + 2))];
 }
-static void nvmtl_air_walk_struct(NSDictionary *nodes, NSString *node, NSString *bufKey, NSMutableDictionary *members, NSMutableDictionary *types, NSMutableSet *seen) {
+// ptrs: for a member that is an embedded buffer (an air.buffer node), what it points at: the pointee's size, alignment and
+// members, as Apple's reflection gives an MTLPointerType. VFX checks them ("ibl size mismatch 0 != 208").
+static NSArray *nvmtl_air_struct_members(NSDictionary *nodes, NSString *node);
+static void nvmtl_air_walk_struct(NSDictionary *nodes, NSString *node, NSString *bufKey, NSMutableDictionary *members, NSMutableDictionary *types, NSMutableSet *seen,
+                                  NSMutableDictionary *ptrs) {
     if (!node || [seen containsObject:node]) return;
     [seen addObject:node];
     NSString *line = nodes[node]; if (!line) return;
@@ -2197,6 +2223,14 @@ static void nvmtl_air_walk_struct(NSDictionary *nodes, NSString *node, NSString 
             if (argLine) {
                 id_ = nvmtl_air_i32_after(argLine, @"air.location_index");
                 if (id_ < 0) id_ = [[argLine substringFromIndex:MIN(argLine.length, (NSUInteger)[argLine rangeOfString:@"!{i32 "].location + 6)] integerValue];
+                if (ptrs && id_ >= 0 && [argLine rangeOfString:@"!\"air.buffer\""].location != NSNotFound) {
+                    NSInteger sz = nvmtl_air_i32_after(argLine, @"air.buffer_size"); if (sz <= 0) sz = nvmtl_air_i32_after(argLine, @"air.arg_type_size");
+                    const NSInteger al = nvmtl_air_i32_after(argLine, @"air.arg_type_align_size");
+                    NSString *st = nvmtl_air_node_after(argLine, @"air.struct_type_info", 0, NULL);
+                    NSArray *pm = st ? nvmtl_air_struct_members(nodes, st) : nil;
+                    NSString *pk = [NSString stringWithFormat:@"%@:%ld", bufKey, (long)id_];
+                    if (!ptrs[pk]) ptrs[pk] = @{ @"size": @(sz > 0 ? sz : 0), @"align": @(al > 0 ? al : 0), @"members": pm ?: @[] };
+                }
             }
         }
         if (name && id_ >= 0) {
@@ -2206,10 +2240,21 @@ static void nvmtl_air_walk_struct(NSDictionary *nodes, NSString *node, NSString 
         r = [line rangeOfString:tag options:0 range:NSMakeRange(after, line.length - after)];
     }
 }
+static NSArray *nvmtl_air_struct_members(NSDictionary *nodes, NSString *node);
 static void nvmtl_air_plain_struct(NSDictionary *nodes, NSString *node, NSInteger loc, NSMutableDictionary *plain) {
-    NSString *line = node ? nodes[node] : nil; if (!line || loc < 0) return;
-    if ([line rangeOfString:@"!\"air.indirect_argument\""].location != NSNotFound) return;
-    NSRange br = [line rangeOfString:@"!{"]; if (br.location == NSNotFound) return;
+    if (loc < 0) return;
+    NSArray *ms = nvmtl_air_struct_members(nodes, node);
+    if (ms.count) plain[@(loc)] = ms;
+}
+// The members of one air.struct_type_info tuple that is not an argument buffer: offset, size, count, type and name each.
+// A member that is itself a struct is preceded by !"air.struct_type_info", !N; its members come back under "struct", so
+// reflection can describe it (VFX reads particle_header.descriptions[].offset/type/stride by name).
+static NSArray *nvmtl_air_struct_members_d(NSDictionary *nodes, NSString *node, int depth);
+static NSArray *nvmtl_air_struct_members(NSDictionary *nodes, NSString *node) { return nvmtl_air_struct_members_d(nodes, node, 0); }
+static NSArray *nvmtl_air_struct_members_d(NSDictionary *nodes, NSString *node, int depth) {
+    NSString *line = node ? nodes[node] : nil; if (!line || depth > 8) return nil;
+    if ([line rangeOfString:@"!\"air.indirect_argument\""].location != NSNotFound) return nil;
+    NSRange br = [line rangeOfString:@"!{"]; if (br.location == NSNotFound) return nil;
     NSMutableArray *tok = [NSMutableArray array]; NSMutableString *cur = [NSMutableString string]; BOOL q = NO;
     for (NSUInteger i = br.location + 2; i < line.length; i++) {
         unichar c = [line characterAtIndex:i];
@@ -2218,16 +2263,24 @@ static void nvmtl_air_plain_struct(NSDictionary *nodes, NSString *node, NSIntege
         [cur appendFormat:@"%C", c];
     }
     NSMutableArray *ms = [NSMutableArray array];
-    for (NSUInteger i = 0; i + 4 < tok.count; ) {
+    NSString *nested = nil;
+    for (NSUInteger i = 0; i < tok.count; ) {
+        if ([tok[i] isEqualToString:@"!\"air.struct_type_info\""] && i + 1 < tok.count && [tok[i + 1] hasPrefix:@"!"] && ![tok[i + 1] hasPrefix:@"!\""]) {
+            nested = tok[i + 1]; i += 2; continue;
+        }
+        if (i + 4 >= tok.count) break;
         NSString *a = tok[i], *b = tok[i + 1], *c = tok[i + 2], *t = tok[i + 3], *n = tok[i + 4];
         if ([a hasPrefix:@"i32 "] && [b hasPrefix:@"i32 "] && [c hasPrefix:@"i32 "] && [t hasPrefix:@"!\""] && [n hasPrefix:@"!\""] && t.length > 3 && n.length > 3) {
-            [ms addObject:@{ @"off": @([[a substringFromIndex:4] integerValue]), @"size": @([[b substringFromIndex:4] integerValue]),
-                             @"count": @([[c substringFromIndex:4] integerValue]),
-                             @"type": [t substringWithRange:NSMakeRange(2, t.length - 3)], @"name": [n substringWithRange:NSMakeRange(2, n.length - 3)] }];
+            NSMutableDictionary *m = [@{ @"off": @([[a substringFromIndex:4] integerValue]), @"size": @([[b substringFromIndex:4] integerValue]),
+                                         @"count": @([[c substringFromIndex:4] integerValue]),
+                                         @"type": [t substringWithRange:NSMakeRange(2, t.length - 3)], @"name": [n substringWithRange:NSMakeRange(2, n.length - 3)] } mutableCopy];
+            NSArray *sub = nested ? nvmtl_air_struct_members_d(nodes, nested, depth + 1) : nil;
+            if (sub.count) m[@"struct"] = sub;
+            [ms addObject:m]; nested = nil;
             i += 5;
-        } else i++;
+        } else { nested = nil; i++; }
     }
-    if (ms.count) plain[@(loc)] = ms;
+    return ms;
 }
 NSDictionary *nvmtl_air_names(NVMTLFunction *fn)
 {
@@ -2238,18 +2291,23 @@ NSDictionary *nvmtl_air_names(NVMTLFunction *fn)
         NSMutableDictionary *plain = [NSMutableDictionary new];
         // access: each buffer's and texture's AIR access qualifier (read, read_write, write, sample); align: each buffer's
         // air.arg_type_align_size. Both as the source declares them, which is what Apple's reflection reports.
-        NSMutableDictionary *access = [NSMutableDictionary new], *align = [NSMutableDictionary new];
-        fn->_airNames = @{ @"args": args, @"members": members, @"types": types, @"plain": plain, @"access": access, @"align": align };
+        NSMutableDictionary *access = [NSMutableDictionary new], *align = [NSMutableDictionary new], *ptrs = [NSMutableDictionary new];
+        fn->_airNames = @{ @"args": args, @"members": members, @"types": types, @"plain": plain, @"access": access, @"align": align, @"ptrs": ptrs };
         NSString *ll = fn->_air, *fname = fn->_fname;
         if (!ll.length || !fname.length) return fn->_airNames;
         NSMutableDictionary *nodes = [NSMutableDictionary new];
-        NSString *entryLine = nil; NSString *entryNeedle = [NSString stringWithFormat:@"@%@, ", fname];
+        // LLVM quotes a function name that is not a plain identifier (VFX's "vfx_custom_shader_clouds_shader_39::vfx_fragment"),
+        // so the entry node is looked for under both spellings, as the grid-only and argument-buffer scans do. With only the
+        // bare one such a function had no names at all: its argument buffers were reflected as "buffer0" with members
+        // "field0".. typed as pointers, and VFX (Messages' animated backgrounds) stopped on the type ("Unsupported dataType").
+        NSString *entryLine = nil, *entryNeedle = nil;
+        NSArray<NSString *> *needles = @[[NSString stringWithFormat:@"@%@, ", fname], [NSString stringWithFormat:@"@\"%@\", ", fname]];
         NSArray *lines = [ll componentsSeparatedByString:@"\n"];
         for (NSString *line in lines) {
             if (![line hasPrefix:@"!"]) continue;
             NSRange eq = [line rangeOfString:@" = !{"]; if (eq.location == NSNotFound) continue;
             nodes[[line substringToIndex:eq.location]] = line;
-            if (!entryLine && [line rangeOfString:entryNeedle].location != NSNotFound) entryLine = line;
+            if (!entryLine) for (NSString *nd in needles) if ([line rangeOfString:nd].location != NSNotFound) { entryLine = line; entryNeedle = nd; break; }
         }
         if (!entryLine) { nvlog("air names: no entry node for %s", fname.UTF8String); return fn->_airNames; }
         NSRange nr = [entryLine rangeOfString:entryNeedle];
@@ -2279,7 +2337,7 @@ NSDictionary *nvmtl_air_names(NVMTLFunction *fn)
             const NSInteger al = nvmtl_air_i32_after(line, @"air.arg_type_align_size"); if (al > 0) align[k] = @(al);
             if ([kind isEqualToString:@"buffer"]) {
                 NSString *st = nvmtl_air_node_after(line, @"air.struct_type_info", 0, NULL);
-                if (st) nvmtl_air_walk_struct(nodes, st, [NSString stringWithFormat:@"%ld", (long)loc], members, types, [NSMutableSet new]);
+                if (st) nvmtl_air_walk_struct(nodes, st, [NSString stringWithFormat:@"%ld", (long)loc], members, types, [NSMutableSet new], ptrs);
                 if (st) nvmtl_air_plain_struct(nodes, st, loc, plain);
             }
         }
@@ -2998,8 +3056,11 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
                   @"!\"air.visible_function_table\"",
                   @"!\"air.intersection_function_table\""];
     });
+    // Every form contains "_function_table", so one byte-wise search clears the common case. The searches are literal:
+    // the forms are ASCII, and the default (Unicode-aware) comparison cost tens of milliseconds per call on large modules.
+    if ([air rangeOfString:@"_function_table" options:NSLiteralSearch].location == NSNotFound) return NO;
     for (NSString *f in forms)
-        if ([air rangeOfString:f].location != NSNotFound) return YES;
+        if ([air rangeOfString:f options:NSLiteralSearch].location != NSNotFound) return YES;
     return NO;
 }
 
